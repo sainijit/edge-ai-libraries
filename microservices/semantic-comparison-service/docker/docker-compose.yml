@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  semantic-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        - HTTP_PROXY=${HTTP_PROXY}
+        - HTTPS_PROXY=${HTTPS_PROXY}
+        - NO_PROXY=${NO_PROXY}
+        - http_proxy=${http_proxy}
+        - https_proxy=${https_proxy}
+        - no_proxy=${no_proxy}
+    image: semantic-search-agent:latest
+    container_name: semantic-search-agent
+    ports:
+      - "8080:8080"    # API endpoint
+      - "9090:9090"    # Prometheus metrics
+    volumes:
+      - ../config:/app/config:ro  # Mount config as read-only
+      - ./logs:/app/logs          # Logs directory
+    environment:
+      - SERVICE_NAME=v
+      - LOG_LEVEL=INFO
+      - VLM_BACKEND=ovms
+      - OVMS_ENDPOINT=http://ovms-vlm:8000
+      - CACHE_ENABLED=true
+      - CACHE_BACKEND=memory
+      - PROMETHEUS_ENABLED=true
+    depends_on:
+      - ovms-vlm
+    networks:
+      - semantic-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # OVMS for VLM inference (optional - can use existing OVMS instance)
+  ovms-vlm:
+    image: openvino/model_server:latest-gpu
+    container_name: ovms-vlm
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../../ovms-vlm/models_vlm:/models:ro
+    command: >
+      --config_path /models/config.json
+      --port 8000
+    networks:
+      - semantic-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: semantic-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - semantic-net
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+networks:
+  semantic-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
