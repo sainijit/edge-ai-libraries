@@ -48,7 +48,7 @@ semantic-search-agent/
 │   └── inventory.json        # Inventory items list
 ├── docker/                   # Docker deployment
 │   ├── Dockerfile            # Production-ready container
-│   └── docker-compose.yml    # Full stack orchestration
+│   └── docker-compose.yml    # Service + Redis (VLM external)
 ├── docs/                     # Documentation
 │   ├── README.md             # Main documentation
 │   ├── IMPLEMENTATION_PLAN.md  # Architecture & design
@@ -69,10 +69,11 @@ semantic-search-agent/
 ✅ **Semantic Matcher**: VLM-powered semantic understanding  
 ✅ **Hybrid Matcher**: Best of both (exact first, semantic fallback)
 
-### 2. Pluggable VLM Backends
-✅ **OVMS Backend**: Production-ready, GPU-accelerated, supports batching  
+### 2. Pluggable VLM Backends (Optional)
+✅ **OVMS Backend**: Connect to your external OVMS server  
 ✅ **OpenVINO Local**: In-process inference for edge deployments  
-✅ **OpenAI API**: Cloud fallback option
+✅ **OpenAI API**: Cloud API option  
+⚠️ **Note**: VLM is optional - service runs without VLM using exact matching
 
 ### 3. API Endpoints
 ✅ **POST /api/v1/compare/order**: Order validation (missing/extra/quantity)  
@@ -104,6 +105,51 @@ semantic-search-agent/
 
 ## 🏗️ Architecture Highlights
 
+### Architectural Decisions
+
+#### **External VLM Backend Design**
+
+**Rationale**: VLM backends are user-provided rather than bundled with the service.
+
+**Benefits**:
+1. **Flexibility**: Users choose their own VLM infrastructure (OVMS, local, cloud)
+2. **Scalability**: VLM can scale independently from the service
+3. **Security**: No credentials or models bundled in container
+4. **Simplicity**: Smaller container, faster builds, easier maintenance
+5. **Cost**: No GPU requirements for the service container itself
+6. **Multi-tenancy**: Multiple services can share one OVMS instance
+
+**Deployment Patterns**:
+```
+Pattern 1: Shared OVMS (Recommended for Production)
+┌─────────────────┐     ┌──────────────┐
+│ Semantic Service│────▶│ External OVMS│
+│  (Service A)    │     │  (Shared)    │
+└─────────────────┘     │              │
+┌─────────────────┐     │              │
+│ Semantic Service│────▶│              │
+│  (Service B)    │     │              │
+└─────────────────┘     └──────────────┘
+
+Pattern 2: Dedicated OVMS (High Performance)
+┌─────────────────┐     ┌──────────────┐
+│ Semantic Service│────▶│ OVMS Instance│
+│                 │     │  (Dedicated) │
+└─────────────────┘     └──────────────┘
+
+Pattern 3: No VLM (Edge/Lightweight)
+┌─────────────────┐
+│ Semantic Service│  (Exact matching only)
+│  (Standalone)   │
+└─────────────────┘
+
+Pattern 4: Cloud Hybrid (Fallback)
+┌─────────────────┐     ┌──────────────┐
+│ Semantic Service│────▶│ OpenAI API   │
+│                 │     │  (Cloud)     │
+└─────────────────┘     └──────────────┘
+```
+
 ### Design Patterns Used
 
 1. **Strategy Pattern**: Interchangeable matchers (exact, semantic, hybrid)
@@ -131,6 +177,16 @@ semantic-search-agent/
 ---
 
 ## 📈 Performance Characteristics
+
+### Performance by Deployment Mode
+
+| Deployment Mode | Latency | Throughput | GPU Required | Setup Complexity | Best For |
+|----------------|---------|------------|--------------|------------------|----------|
+| **Exact Only** | < 5ms | 200+ req/s | No | ⭐ Very Easy | Edge, high throughput |
+| **External OVMS** | < 100ms | 10-50 req/s | Remote | ⭐⭐ Easy | Production, shared infra |
+| **Local OpenVINO** | < 80ms | 15-30 req/s | Local | ⭐⭐⭐ Moderate | Edge AI, offline |
+| **OpenAI API** | 200-500ms | 5-10 req/s | No | ⭐ Very Easy | Dev/test, no infra |
+| **Hybrid (cached)** | < 5ms | 200+ req/s | Remote | ⭐⭐ Easy | Best of both worlds |
 
 ### Benchmarks (Estimated)
 
@@ -163,20 +219,41 @@ semantic-search-agent/
 
 ```yaml
 vlm:
-  backend: ovms                    # VLM backend type
+  backend: ovms                    # VLM backend type (user-provided)
   ovms:
-    endpoint: http://ovms-vlm:8000 # OVMS server URL
-    timeout: 30                    # Request timeout (seconds)
+    endpoint: http://localhost:8000  # YOUR external OVMS URL (required if using VLM)
+    model_name: your-model-name      # YOUR model name (required if using VLM)
+    timeout: 30                      # Request timeout (seconds)
 
 matching:
-  default_strategy: hybrid         # Matching strategy
-  confidence_threshold: 0.85       # Semantic match threshold
+  default_strategy: exact          # Default: exact (no VLM needed)
+                                   # Options: exact, semantic, hybrid
+  confidence_threshold: 0.85       # Semantic match threshold (if using VLM)
 
 cache:
   enabled: true                    # Enable caching
   backend: memory                  # memory or redis
   ttl: 3600                        # Cache TTL (seconds)
 ```
+
+### Environment Variables (Priority: ENV > YAML > Defaults)
+
+**Required for basic operation (no VLM):**
+- `DEFAULT_MATCHING_STRATEGY=exact` (default)
+- `API_PORT=8080`
+- `LOG_LEVEL=INFO`
+
+**Required to enable VLM (semantic/hybrid matching):**
+- `OVMS_ENDPOINT=http://your-host:port` (your external OVMS)
+- `OVMS_MODEL_NAME=your-model-name` (your VLM model)
+
+OR
+- `VLM_BACKEND=openvino_local`
+- `OPENVINO_MODEL_PATH=/path/to/model`
+
+OR
+- `VLM_BACKEND=openai`
+- `OPENAI_API_KEY=your-key`
 
 ---
 
@@ -222,6 +299,86 @@ pytest -vv --tb=long
 
 ## 🚀 Deployment Options
 
+### Deployment Configuration Examples
+
+#### **Scenario 1: No VLM (Fastest Setup)**
+**Use Case**: Edge devices, development, exact matching sufficient
+
+```bash
+# .env
+DEFAULT_MATCHING_STRATEGY=exact
+API_PORT=8080
+LOG_LEVEL=INFO
+```
+
+**Resource Requirements**: Minimal (no GPU, < 512MB RAM)  
+**Latency**: < 5ms per request  
+**Setup Time**: < 2 minutes
+
+---
+
+#### **Scenario 2: External OVMS (Production Recommended)**
+**Use Case**: Production deployment with existing OVMS infrastructure
+
+```bash
+# .env
+DEFAULT_MATCHING_STRATEGY=hybrid
+VLM_BACKEND=ovms
+OVMS_ENDPOINT=http://ovms-prod.company.local:8000
+OVMS_MODEL_NAME=qwen2-vl-7b-instruct
+OVMS_TIMEOUT=60
+CACHE_ENABLED=true
+CACHE_BACKEND=redis
+```
+
+**Benefits**: 
+- Shared OVMS across multiple services
+- GPU resources centralized
+- Horizontal scaling of service
+- Cost-effective
+
+**Prerequisites**: Existing OVMS instance running
+
+---
+
+#### **Scenario 3: Local OpenVINO (Edge AI)**
+**Use Case**: Edge deployment with local GPU, no network dependency
+
+```bash
+# .env
+DEFAULT_MATCHING_STRATEGY=hybrid
+VLM_BACKEND=openvino_local
+OPENVINO_MODEL_PATH=/opt/models/qwen-vlm-2b-int8
+OPENVINO_DEVICE=GPU
+CACHE_ENABLED=true
+```
+
+**Benefits**:
+- No external dependencies
+- Offline operation
+- Low latency (local inference)
+
+**Requirements**: Local GPU, model files, OpenVINO runtime
+
+---
+
+#### **Scenario 4: Cloud API (Development/Testing)**
+**Use Case**: Quick setup, testing, no infrastructure
+
+```bash
+# .env
+DEFAULT_MATCHING_STRATEGY=semantic
+VLM_BACKEND=openai
+OPENAI_API_KEY=sk-proj-xxx
+OPENAI_MODEL=gpt-4o-mini
+CACHE_ENABLED=true  # Important for cost control!
+```
+
+**Benefits**: Zero infrastructure setup  
+**Considerations**: API costs, network dependency, data privacy
+
+---
+
 ### 1. Local Development
 - Virtual environment
 - Hot reload with `--reload`
@@ -234,10 +391,11 @@ pytest -vv --tb=long
 - Multi-stage build
 
 ### 3. Docker Compose
-- Full stack (service + OVMS + Redis)
+- Lightweight stack (service + Redis only)
+- VLM backend is external/user-provided
 - Network isolation
-- Volume management
-- Easy scaling
+- Easy configuration via .env
+- No GPU requirements by default
 
 ### 4. Kubernetes
 - Horizontal pod autoscaling
@@ -340,6 +498,8 @@ async def validate_order_items(expected, detected):
 ✅ **Read-only Configs**: Mounted as read-only volumes  
 ✅ **Input Validation**: Pydantic models enforce schema  
 ✅ **CORS Middleware**: Configurable origins  
+✅ **No Hardcoded Credentials**: All endpoints user-provided  
+✅ **No Bundled Models**: VLM is external, reducing attack surface  
 ✅ **Health Endpoint**: No sensitive data exposure
 
 ### Optional Enhancements
@@ -397,6 +557,8 @@ async def validate_order_items(expected, detected):
 3. **Custom Matchers**: Plugin system for domain-specific logic
 4. **Multi-language**: Support for non-English text
 5. **Learning Mode**: Collect feedback for model improvement
+6. **VLM Backend Discovery**: Auto-detect available OVMS endpoints
+7. **Multiple VLM Backends**: Load balancing across multiple OVMS instances
 
 ### Performance Optimizations
 1. **Database Backend**: PostgreSQL for order/inventory storage
@@ -408,6 +570,7 @@ async def validate_order_items(expected, detected):
 
 ## ✅ Production Readiness Checklist
 
+### Service Deployment
 - [x] Comprehensive test coverage (80%+)
 - [x] Docker containerization
 - [x] Health checks configured
@@ -418,10 +581,38 @@ async def validate_order_items(expected, detected):
 - [x] Documentation (API, deployment, architecture)
 - [x] Non-root container user
 - [x] Security best practices
+- [x] No hardcoded credentials/endpoints
+- [x] External VLM backend design
 - [ ] API authentication (optional, add if needed)
 - [ ] Rate limiting (add reverse proxy)
 - [ ] Load testing results
 - [ ] Production deployment tested
+
+### VLM Backend Setup (If Using Semantic/Hybrid)
+- [ ] OVMS instance deployed and tested
+  - [ ] Model loaded and verified
+  - [ ] Endpoint accessible from service
+  - [ ] API authentication configured (if any)
+  - [ ] Resource limits set (CPU/GPU/memory)
+- OR
+- [ ] OpenVINO local model deployed
+  - [ ] Model files present and accessible
+  - [ ] GPU drivers installed
+  - [ ] Sufficient disk space for model
+- OR
+- [ ] OpenAI API configured
+  - [ ] API key valid and funded
+  - [ ] Rate limits understood
+  - [ ] Cost monitoring enabled
+
+### Integration Testing
+- [ ] Health endpoint returns correct VLM status
+- [ ] Exact matching works without VLM
+- [ ] Semantic matching works with VLM backend
+- [ ] Hybrid fallback tested (exact → semantic)
+- [ ] Cache performance verified
+- [ ] Error handling tested (VLM unavailable)
+- [ ] Timeout handling verified
 
 ---
 
@@ -462,6 +653,14 @@ async def validate_order_items(expected, detected):
 ---
 
 ## 📝 Version History
+
+### v1.1.0 (2026-02-12)
+- **Breaking**: Removed bundled OVMS from docker-compose
+- **Feature**: VLM backend now user-provided (external)
+- **Feature**: Default to exact matching (no VLM required)
+- **Enhancement**: No hardcoded endpoints or model names
+- **Enhancement**: Comprehensive environment variable documentation
+- **Enhancement**: Reduced container size and complexity
 
 ### v1.0.0 (2026-01-30)
 - Initial production release

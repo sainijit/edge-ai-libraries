@@ -9,24 +9,24 @@ vlm:
   backend: ovms  # Options: openvino_local, ovms, openai
   
   ovms:
-    endpoint: http://ovms-vlm:8000
-    model_name: Qwen2-VL-2B-Instruct
+    endpoint: http://localhost:8000  # Set via OVMS_ENDPOINT environment variable
+    model_name: vision-language-model  # Set via OVMS_MODEL_NAME environment variable
     timeout: 30
     api_path: /v3/chat/completions
   
   openvino_local:
-    model_path: /models/Qwen2-VL-2B-Instruct
+    model_path: /models/vision-language-model  # Set via OPENVINO_MODEL_PATH environment variable
     device: GPU
     max_new_tokens: 512
     temperature: 0.0
   
   openai:
-    model: gpt-4o-mini
+    model: gpt-4o-mini  # Set via OPENAI_MODEL environment variable
     max_tokens: 100
     temperature: 0.0
 
 matching:
-  default_strategy: hybrid  # Options: exact, semantic, hybrid
+  default_strategy: exact  # Options: exact, semantic, hybrid (set to 'exact' for no VLM)
   
   exact_match:
     case_insensitive: true

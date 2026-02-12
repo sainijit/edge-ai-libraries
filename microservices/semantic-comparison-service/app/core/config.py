@@ -70,12 +70,13 @@ class Settings(BaseSettings):
     
     # Paths
     config_dir: Path = Field(default=Path(__file__).parent.parent.parent / "config")
-    orders_file: Path = Field(default=None)
-    inventory_file: Path = Field(default=None)
+    orders_file: Path | None = Field(default=None)
+    inventory_file: Path | None = Field(default=None)
     
     def __init__(self, **data):
         """Initialize settings with paths."""
         super().__init__(**data)
+        # Set default paths if not provided
         if self.orders_file is None:
             self.orders_file = self.config_dir / "orders.json"
         if self.inventory_file is None:
