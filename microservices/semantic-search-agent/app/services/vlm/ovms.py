@@ -20,7 +20,8 @@ class OVMSBackend(BaseVLMBackend):
         self.model_name = settings.ovms_model_name
         self.timeout = settings.ovms_timeout
         self.api_url = f"{self.endpoint}/v3/chat/completions"
-        self._client = httpx.AsyncClient(timeout=self.timeout)
+        # Disable proxy for internal OVMS requests (trust_env=False ignores HTTP_PROXY env vars)
+        self._client = httpx.AsyncClient(timeout=self.timeout, trust_env=False)
         
         logger.info(f"Initialized OVMS backend: {self.endpoint}")
     
@@ -32,8 +33,19 @@ class OVMSBackend(BaseVLMBackend):
     def is_available(self) -> bool:
         """Check if OVMS endpoint is available."""
         try:
-            response = httpx.get(f"{self.endpoint}/v1/models", timeout=5.0)
-            return response.status_code == 200
+            # For VLM deployments, test with a minimal chat completion request
+            # The /v1/config endpoint may not work reliably for VLM models
+            # Use trust_env=False to bypass proxy settings for internal requests
+            with httpx.Client(timeout=15.0, trust_env=False) as client:
+                response = client.post(
+                    f"{self.endpoint}/v3/chat/completions",
+                    json={
+                        "model": self.model_name,
+                        "messages": [{"role": "user", "content": "test"}],
+                        "max_tokens": 1,
+                    },
+                )
+                return response.status_code == 200
         except Exception as e:
             logger.warning(f"OVMS health check failed: {e}")
             return False

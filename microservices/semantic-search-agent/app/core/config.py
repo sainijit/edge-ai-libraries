@@ -6,8 +6,13 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class VLMConfigurationError(Exception):
+    """Raised when VLM backend is not properly configured."""
+    pass
 
 
 class Settings(BaseSettings):
@@ -32,14 +37,14 @@ class Settings(BaseSettings):
         default="ovms", alias="VLM_BACKEND"
     )
     
-    # OVMS configuration
-    ovms_endpoint: str = Field(default="http://ovms-vlm:8000", alias="OVMS_ENDPOINT")
-    ovms_model_name: str = Field(default="Qwen2-VL-2B-Instruct", alias="OVMS_MODEL_NAME")
+    # OVMS configuration (required if VLM_BACKEND=ovms and strategy is semantic/hybrid)
+    ovms_endpoint: str = Field(default="", alias="OVMS_ENDPOINT")
+    ovms_model_name: str = Field(default="", alias="OVMS_MODEL_NAME")
     ovms_timeout: int = Field(default=30, alias="OVMS_TIMEOUT")
     
-    # OpenVINO local configuration
+    # OpenVINO local configuration (required if VLM_BACKEND=openvino_local)
     openvino_model_path: str = Field(
-        default="/models/Qwen2-VL-2B-Instruct", alias="OPENVINO_MODEL_PATH"
+        default="", alias="OPENVINO_MODEL_PATH"
     )
     openvino_device: str = Field(default="GPU", alias="OPENVINO_DEVICE")
     openvino_max_new_tokens: int = Field(default=512, alias="OPENVINO_MAX_NEW_TOKENS")
@@ -60,7 +65,7 @@ class Settings(BaseSettings):
     
     # Matching configuration
     default_matching_strategy: Literal["exact", "semantic", "hybrid"] = Field(
-        default="hybrid", alias="DEFAULT_MATCHING_STRATEGY"
+        default="exact", alias="DEFAULT_MATCHING_STRATEGY"
     )
     confidence_threshold: float = Field(default=0.85, alias="CONFIDENCE_THRESHOLD")
     max_retries: int = Field(default=2, alias="MAX_RETRIES")
@@ -81,6 +86,62 @@ class Settings(BaseSettings):
             self.orders_file = self.config_dir / "orders.json"
         if self.inventory_file is None:
             self.inventory_file = self.config_dir / "inventory.json"
+    
+    @model_validator(mode="after")
+    def validate_vlm_configuration(self) -> "Settings":
+        """
+        Validate VLM backend configuration when semantic/hybrid matching is enabled.
+        
+        Raises:
+            VLMConfigurationError: If VLM backend is not properly configured
+        """
+        # Skip validation if using exact matching only
+        if self.default_matching_strategy == "exact":
+            return self
+        
+        # VLM is required for semantic/hybrid strategies
+        strategy = self.default_matching_strategy
+        backend = self.vlm_backend
+        
+        if backend == "ovms":
+            missing = []
+            if not self.ovms_endpoint or self.ovms_endpoint.strip() == "":
+                missing.append("OVMS_ENDPOINT")
+            if not self.ovms_model_name or self.ovms_model_name.strip() == "":
+                missing.append("OVMS_MODEL_NAME")
+            
+            if missing:
+                raise VLMConfigurationError(
+                    f"VLM backend 'ovms' requires {', '.join(missing)} to be set "
+                    f"when using '{strategy}' matching strategy. "
+                    f"Either set these variables or use DEFAULT_MATCHING_STRATEGY=exact"
+                )
+            
+            # Validate endpoint format
+            if not (self.ovms_endpoint.startswith("http://") or 
+                    self.ovms_endpoint.startswith("https://")):
+                raise VLMConfigurationError(
+                    f"OVMS_ENDPOINT must start with 'http://' or 'https://'. "
+                    f"Got: '{self.ovms_endpoint}'"
+                )
+        
+        elif backend == "openvino_local":
+            if not self.openvino_model_path or self.openvino_model_path.strip() == "":
+                raise VLMConfigurationError(
+                    f"VLM backend 'openvino_local' requires OPENVINO_MODEL_PATH to be set "
+                    f"when using '{strategy}' matching strategy. "
+                    f"Either set this variable or use DEFAULT_MATCHING_STRATEGY=exact"
+                )
+        
+        elif backend == "openai":
+            if not self.openai_api_key or self.openai_api_key.strip() == "":
+                raise VLMConfigurationError(
+                    f"VLM backend 'openai' requires OPENAI_API_KEY to be set "
+                    f"when using '{strategy}' matching strategy. "
+                    f"Either set this variable or use DEFAULT_MATCHING_STRATEGY=exact"
+                )
+        
+        return self
     
     @classmethod
     def from_yaml(cls, config_path: Path) -> "Settings":

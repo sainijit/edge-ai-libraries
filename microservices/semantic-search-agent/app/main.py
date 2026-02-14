@@ -22,15 +22,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     setup_logging(settings.log_level)
     logger.info(f"Starting {settings.service_name} v{settings.service_version}")
     
-    # Initialize VLM backend
-    try:
-        vlm_backend = VLMBackendFactory.create(settings.vlm_backend)
-        if vlm_backend.is_available():
-            logger.info(f"VLM backend '{settings.vlm_backend}' initialized successfully")
-        else:
-            logger.warning(f"VLM backend '{settings.vlm_backend}' is not available")
-    except Exception as e:
-        logger.error(f"Failed to initialize VLM backend: {e}")
+    # Initialize VLM backend only if matching strategy requires it
+    if settings.default_matching_strategy in ("semantic", "hybrid"):
+        try:
+            vlm_backend = VLMBackendFactory.create(settings.vlm_backend)
+            if vlm_backend.is_available():
+                logger.info(f"VLM backend '{settings.vlm_backend}' initialized successfully")
+            else:
+                logger.warning(f"VLM backend '{settings.vlm_backend}' is not available")
+        except Exception as e:
+            logger.error(f"Failed to initialize VLM backend: {e}")
+    else:
+        logger.info(f"Using '{settings.default_matching_strategy}' matching strategy - VLM backend not required")
     
     yield
     
