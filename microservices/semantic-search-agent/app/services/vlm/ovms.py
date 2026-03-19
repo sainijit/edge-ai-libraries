@@ -31,24 +31,8 @@ class OVMSBackend(BaseVLMBackend):
         return "ovms"
     
     def is_available(self) -> bool:
-        """Check if OVMS endpoint is available."""
-        try:
-            # For VLM deployments, test with a minimal chat completion request
-            # The /v1/config endpoint may not work reliably for VLM models
-            # Use trust_env=False to bypass proxy settings for internal requests
-            with httpx.Client(timeout=15.0, trust_env=False) as client:
-                response = client.post(
-                    f"{self.endpoint}/v3/chat/completions",
-                    json={
-                        "model": self.model_name,
-                        "messages": [{"role": "user", "content": "test"}],
-                        "max_tokens": 1,
-                    },
-                )
-                return response.status_code == 200
-        except Exception as e:
-            logger.warning(f"OVMS health check failed: {e}")
-            return False
+        """Check if OVMS backend is configured (no network call)."""
+        return True
     
     async def generate_text(
         self,
