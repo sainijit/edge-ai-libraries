@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
-import os
 import pathlib
 from http import HTTPStatus
 from typing import List, Optional, Tuple
@@ -10,8 +9,7 @@ from typing import List, Optional, Tuple
 from minio import Minio
 from minio.error import S3Error
 
-from src.common import DataPrepException, Strings
-from src.logger import logger
+from src.common import DataPrepException, Strings, logger
 
 
 class MinioClient:
@@ -47,25 +45,28 @@ class MinioClient:
                 raise Exception(Strings.minio_conn_error)
 
     def ensure_bucket_exists(self, bucket_name: str):
-        """Check if the specified bucket exists and raise an error if it doesn't.
+        """Check if the specified bucket exists and create it if it doesn't.
 
         Args:
-            bucket_name (str): The name of the bucket to check
+            bucket_name (str): The name of the bucket to check/create
 
         Raises:
-            Exception: If bucket doesn't exist or check fails
+            Exception: If bucket creation fails or check fails
         """
         try:
             if not self.client.bucket_exists(bucket_name):
-                logger.error(f"Bucket '{bucket_name}' does not exist")
-                raise DataPrepException(
-                    status_code=HTTPStatus.NOT_FOUND, msg=f"Bucket '{bucket_name}' not found"
-                )
+                logger.warning(f"Bucket '{bucket_name}' does not exist, creating it...")
+                self.client.make_bucket(bucket_name)
+                logger.info(f"Successfully created bucket '{bucket_name}'")
             else:
-                logger.debug(f"Bucket '{bucket_name}' exists")
+                logger.debug(f"Bucket '{bucket_name}' already exists")
         except S3Error as ex:
-            logger.error(f"Error checking if bucket exists: {ex}")
-            raise Exception(f"Error while checking whether bucket {bucket_name} exists.")
+            # If bucket name is invalid throw an error which goes as API error response
+            if ex.code == "InvalidBucketName":
+                raise ValueError(f"Invalid bucket name '{bucket_name}'")
+
+            logger.error(f"Error with bucket operations: {ex}")
+            raise Exception(f"Error while ensuring bucket {bucket_name} exists.")
 
     def list_videos(self, bucket_name: str, prefix: str = "") -> List[str]:
         """List all video files in the specified bucket with the given prefix.
@@ -143,7 +144,9 @@ class MinioClient:
             logger.error(f"Error listing directories in bucket {bucket_name}: {ex}")
             raise Exception(f"Error listing video directories in bucket {bucket_name}: {ex}")
 
-    def get_video_in_directory(self, bucket_name: str, video_id: str) -> Optional[str]:
+    def get_video_in_directory(
+        self, bucket_name: str, video_id: str, return_prefix: bool = True
+    ) -> Optional[str]:
         """Get the first video file found in the specified directory.
 
         Args:
@@ -165,8 +168,16 @@ class MinioClient:
 
             # Find the first .mp4 file
             for obj in objects:
-                if obj.object_name.lower().endswith(".mp4"):
-                    return obj.object_name
+                obj_name = obj.object_name
+                if obj_name.lower().endswith(".mp4"):
+
+                    if not return_prefix:
+                        # return the object name without the prefix
+                        obj_name = (
+                            obj_name[len(prefix) :] if obj_name.startswith(prefix) else obj_name
+                        )
+
+                    return obj_name
 
             return None
         except S3Error as ex:

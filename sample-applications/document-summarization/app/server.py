@@ -8,7 +8,6 @@ import logging
 import traceback
 import openlit
 import tempfile
-from typing import Any
 from openai import OpenAI
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -24,6 +23,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from llama_index.core.schema import Document as LlamaDocument
+
 
 tmp_docs_dir = os.path.join(tempfile.gettempdir(), "docs")
 
@@ -35,7 +36,6 @@ logger = logging.getLogger(__name__)
 otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", False)
 
 config = Settings()
-
 
 if not isinstance(trace.get_tracer_provider(), TracerProvider):
     tracer_provider = TracerProvider()
@@ -67,22 +67,21 @@ app = FastAPI(root_path="/v1/docsum", title="Document Summarization API")
 # Add CORS middleware to allow the Gradio UI to make requests to the FastAPI backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ALLOW_ORIGINS.split(
-        ","
-    ),
+    allow_origins=config.CORS_ALLOW_ORIGINS.split(","),
     allow_credentials=True,
     allow_methods=config.CORS_ALLOW_METHODS.split(","),
     allow_headers=config.CORS_ALLOW_HEADERS.split(","),
 )
 
 # Update OpenAILike configuration with proper timeout and retry settings
+
 model = OpenAILike(
     api_base="{}/v3".format(LLM_INFERENCE_URL),
     model=model_name,  
     is_chat_model=True,
     is_function_calling_model=False,
-    timeout=120,  # Increase timeout to 120 seconds
-    max_retries=2,  # Limit number of retries
+    timeout=600,  # Increased timeout for long responses
+    max_retries=10,  # Allow more retries for transient failures
     api_key="not-needed"  # Some implementations require a non-empty API key
 )
 
@@ -106,7 +105,7 @@ def save_uploaded_file(uploaded_file: UploadFile, destination: str):
             # Reset file pointer for potential reuse
             uploaded_file.file.seek(0)
     except Exception as e:
-        logger.error(f"Error saving file: {str(e)}")
+        logger.error("Error saving file: %s", safe_log(str(e), max_len=512))
         raise
 
 
@@ -127,19 +126,54 @@ def clean_directory(directory: str):
         elif os.path.isdir(file_path):
             shutil.rmtree(file_path)
 
+
 def is_file_supported(file):
-    file_root, file_extension = os.path.splitext(file)
-    
+    _, file_extension = os.path.splitext(file)
     return file_extension in config.SUPPORTED_FILE_EXTENSIONS
+
+
+def safe_log(value: object, max_len: int = 255) -> str:
+    """Sanitize untrusted log fields.
+
+    Use 255 when logging filenames (common max filename length).
+    Use 512 for broader user text (for example query) to keep more context.
+
+    Args:
+        value (object): Untrusted value to be logged safely.
+        max_len (int): Maximum output length after sanitization/truncation.
+
+    Returns:
+        str: Log-safe string with CR(carriage return)/LF(line feed) escaped and optional truncation.
+    """
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    return text if len(text) <= max_len else f"{text[:max_len]}..."
+
+
+def chunk_text_file(file_path, max_chars=2000):
+    """Chunk a TXT file by full lines (no mid-line splits)."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    chunks, current_chunk = [], ""
+    for line in lines:
+        if len(current_chunk) + len(line) > max_chars:
+            chunks.append(current_chunk.strip())
+            current_chunk = line
+        else:
+            current_chunk += line
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return [LlamaDocument(text=chunk, metadata={"file_path": file_path}) for chunk in chunks]
+
 
 @app.get("/version")
 def get_version():
     return {"version": "1.0"}
 
+
 @app.post("/summarize/")
-async def stream_data_endpoint(
-    file: UploadFile = File(...), query: str = "Summarize the document"
-):
+async def stream_data_endpoint(file: UploadFile = File(...), query: str = "Summarize the document"):
     """
     Endpoint to summarize a document.
     This endpoint accepts a file upload and a query string. It saves the uploaded file to the "docs" directory,
@@ -151,12 +185,12 @@ async def stream_data_endpoint(
     Returns:
         str: The summary of the document.
     """
-   
+
     try:
-        logger.info(f"Received file: {file.filename}, content-type: {file.content_type}, query: {query}")
-        
+        logger.info("Received summarize request for file=%s", safe_log(file.filename))
+
         if not is_file_supported(file.filename):
-            logger.warning(f"Rejected file: {file.filename} - Only {', '.join(config.SUPPORTED_FILE_EXTENSIONS)} files are allowed to upload")            
+            logger.warning("Rejected file upload: unsupported file type, file=%s", safe_log(file.filename))
             return JSONResponse(
                 status_code=400,
                 content={"message": f"Only {', '.join(config.SUPPORTED_FILE_EXTENSIONS)} files are allowed to upload."},
@@ -168,30 +202,36 @@ async def stream_data_endpoint(
         file_location = os.path.join(tmp_docs_dir, file.filename)
 
         save_uploaded_file(file, file_location)
-        
+
         # Verify file exists and has content
         if not os.path.exists(file_location):
             logger.error(f"File not saved properly at {file_location}")
-            return JSONResponse(
-                status_code=500,
-                content={"message": "Failed to save uploaded file"},
-            )
-        
+            return JSONResponse(status_code=500, content={"message": "Failed to save uploaded file"})
+
         file_size = os.path.getsize(file_location)
         logger.info(f"File saved at {file_location} with size {file_size} bytes")
-        
+
+        # 🔹 Load documents (with TXT chunking support)
         try:
-            logger.info("Loading documents from directory")
-            documents = SimpleDirectoryReader(input_files=[file_location]).load_data()
-            documents[0].doc_id = file.filename
-            logger.info(f"Successfully loaded {file_location} document(s)")
+            logger.info("Loading documents")
+            if file.filename.endswith(".txt"):
+                logger.info(f"Chunking TXT file before summarization with chunk size: {config.CHUNK_SIZE}")
+                documents = chunk_text_file(file_location, max_chars=config.CHUNK_SIZE)
+            else:
+                documents = SimpleDirectoryReader(input_files=[file_location]).load_data()
+
+            # Assign doc_ids for traceability
+            doc_ids = []
+            for i, doc in enumerate(documents):
+                doc_id = f"{file.filename}_part{i}"
+                doc.doc_id = doc_id
+                doc_ids.append(doc_id)
+
+            logger.info(f"Loaded {len(documents)} document(s) from {file_location}")
         except Exception as e:
-            logger.error(f"Error loading documents: {str(e)}")
-            return JSONResponse(
-                status_code=500,
-                content={"message": f"Failed to load document: {str(e)}"},
-            )
-        
+            logger.error("Error loading documents: %s", safe_log(str(e), max_len=512))
+            return JSONResponse(status_code=500, content={"message": "Failed to load document."})
+
         try:
             logger.info("Initializing SimpleSummaryPack")
             simple_summary_pack = SimpleSummaryPack(
@@ -200,27 +240,50 @@ async def stream_data_endpoint(
                 verbose=True,
                 llm=model,
             )
-            logger.info("Running SimpleSummaryPack with query")
-            resp = simple_summary_pack.run(file.filename)
-            logger.info("Successfully generated response")
-            
-            return StreamingResponse(resp, media_type="text/event-stream")
+            logger.info("Running SimpleSummaryPack for all chunks")
+            all_summaries = []
+            for doc_id in doc_ids:
+                try:
+                    summary = simple_summary_pack.run(doc_id)
+                    # If run returns a generator/stream, join to string
+                    if hasattr(summary, '__iter__') and not isinstance(summary, str):
+                        summary = '\n'.join([s for s in summary])
+                    all_summaries.append(summary)
+                except Exception as e:
+                    logger.error("Error summarizing chunk %s: %s", safe_log(doc_id), safe_log(str(e), max_len=512))
+            combined_summary = '\n\n'.join(all_summaries)
+            logger.info("Successfully generated combined summary")
 
-        except Exception as e:
-            logger.error(f"Error in processing: {str(e)}")
-            logger.error(traceback.format_exc())
-            return JSONResponse(
-                status_code=500,
-                content={"message": f"Error processing document: {str(e)}"},
+            # Second LLM call: distill a concise summary from chunk summaries
+            logger.info("Running final LLM call to distill a concise summary from chunk summaries")
+            final_doc = LlamaDocument(text=combined_summary, metadata={"file_path": file_location})
+            final_doc.doc_id = f"{file.filename}_final"
+            final_summary_pack = SimpleSummaryPack(
+                [final_doc],
+                query=query,
+                verbose=True,
+                llm=model,
             )
+            final_doc_id = final_doc.doc_id
+            try:
+                final_summary = final_summary_pack.run(final_doc_id)
+            except Exception as e:
+                logger.error("Error generating final summary: %s", safe_log(str(e), max_len=512))
+                # fallback: yield the combined summary as a single chunk
+                def fallback_gen():
+                    yield combined_summary
+                final_summary = fallback_gen()
+            logger.info("Successfully generated distilled summary")
+            return StreamingResponse(final_summary, media_type="text/event-stream")
+        except Exception as e:
+            logger.error("Error in processing: %s", safe_log(str(e), max_len=512))
+            logger.error(traceback.format_exc())
+            return JSONResponse(status_code=500, content={"message": "Error processing document."})
 
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        logger.error("Unexpected error: %s", safe_log(str(e), max_len=512))
         logger.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"message": f"An error occurred: {str(e)}"},
-        )
+        return JSONResponse(status_code=500, content={"message": "An internal server error occurred."})
     finally:
         try:
             if os.path.exists(tmp_docs_dir):
@@ -228,8 +291,7 @@ async def stream_data_endpoint(
                 clean_directory(tmp_docs_dir)
                 logger.info("Directory cleaned successfully")
         except Exception as e:
-            logger.error(f"Error cleaning directory: {str(e)}")
-
+            logger.error("Error cleaning directory: %s", safe_log(str(e), max_len=512))
 
 FastAPIInstrumentor.instrument_app(app)
 

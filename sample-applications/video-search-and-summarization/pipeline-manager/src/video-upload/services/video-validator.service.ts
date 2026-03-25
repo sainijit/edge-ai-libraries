@@ -1,6 +1,5 @@
 // Copyright (C) 2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
-
 import { Injectable } from '@nestjs/common';
 import { readFile } from 'fs/promises';
 
@@ -27,10 +26,13 @@ export class VideoValidatorService {
       const moovIndex = this.findAtom(fileBuffer, 'moov');
       const mdatIndex = this.findAtom(fileBuffer, 'mdat');
 
-      return moovIndex < mdatIndex;
+  // If either atom is missing, treat as not streamable
+  if (moovIndex === -1 || mdatIndex === -1) return false;
+
+  return moovIndex < mdatIndex;
     } catch (error) {
       console.log(error);
-      throw error;
+  throw error;
     }
   }
 }
