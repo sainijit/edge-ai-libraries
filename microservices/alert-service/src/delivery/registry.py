@@ -5,10 +5,10 @@ from __future__ import annotations
 from src.delivery.base import DeliveryHandler
 from src.delivery.log import LogHandler
 from src.delivery.mqtt import MqttHandler
-from src.delivery.webhook import WebhookHandler
+from src.delivery.websocket import WebSocketHandler
 
 _HANDLERS: dict[str, type[DeliveryHandler]] = {
-    "webhook": WebhookHandler,
+    "websocket": WebSocketHandler,
     "mqtt": MqttHandler,
     "log": LogHandler,
 }

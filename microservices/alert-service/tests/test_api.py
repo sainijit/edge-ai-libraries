@@ -6,6 +6,8 @@ import asyncio
 
 import pytest
 
+from src.delivery.ws_manager import ws_manager
+
 
 class TestHealthEndpoint:
     async def test_health(self, app_client):
@@ -84,3 +86,30 @@ class TestAlertIngestion:
         )
         assert r1.status_code == 200
         assert r2.status_code == 200
+
+
+class TestWebSocketEndpoint:
+    def test_ws_connect_and_disconnect(self, config_file):
+        """WebSocket endpoint accepts connections and handles disconnect."""
+        import os
+        os.environ["CONFIG_PATH"] = config_file
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from src.api.router import api_router
+        from src.core.config import load_config
+        from src.worker import AlertWorker
+
+        config = load_config(config_file)
+        app = FastAPI()
+        app.include_router(api_router, prefix="/api/v1")
+        worker = AlertWorker(config)
+        app.state.worker = worker
+        app.state.config = config
+
+        client = TestClient(app)
+        with client.websocket_connect("/api/v1/ws") as ws:
+            assert ws_manager.active_count >= 1
+
+        # After disconnect, count should be back to 0
+        assert ws_manager.active_count == 0

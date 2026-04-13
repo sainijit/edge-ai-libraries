@@ -37,9 +37,9 @@ class AlertEnvelope:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a clean dict for delivery (excludes raw payload to avoid duplication)."""
         return {
             "alert_type": self.alert_type,
             "metadata": self.metadata,
             "timestamp": self.timestamp,
-            "payload": self.payload,
         }

@@ -12,7 +12,8 @@ from src.core.models import AlertEnvelope
 from src.delivery.log import LogHandler
 from src.delivery.mqtt import MqttHandler
 from src.delivery.registry import get_handler
-from src.delivery.webhook import WebhookHandler
+from src.delivery.websocket import WebSocketHandler
+from src.delivery.ws_manager import ConnectionManager
 
 
 class TestLogHandler:
@@ -29,33 +30,36 @@ class TestLogHandler:
         assert "CONCEALMENT" in caplog.text
 
 
-class TestWebhookHandler:
-    async def test_deliver_success(self, sample_concealment_alert):
-        """WebhookHandler posts JSON and succeeds on 200 response."""
-        handler = WebhookHandler()
+class TestWebSocketHandler:
+    async def test_deliver_broadcasts(self, sample_concealment_alert):
+        """WebSocketHandler broadcasts JSON to connected clients."""
+        handler = WebSocketHandler()
         envelope = AlertEnvelope.from_raw(sample_concealment_alert)
-        target = DeliveryTarget(type="webhook", url="http://test.local/hook")
+        target = DeliveryTarget(type="websocket")
 
-        import httpx
-
-        mock_response = httpx.Response(200, request=httpx.Request("POST", "http://test.local/hook"))
-
-        with patch.object(handler, "_get_client") as mock_get:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_response
-            mock_get.return_value = mock_client
+        with patch("src.delivery.websocket.ws_manager") as mock_mgr:
+            mock_mgr.active_count = 2
+            mock_mgr.broadcast = AsyncMock()
 
             await handler.deliver(envelope, target)
-            mock_client.post.assert_called_once()
 
-    async def test_deliver_no_url_raises(self, sample_concealment_alert):
-        """WebhookHandler raises ValueError when URL is empty."""
-        handler = WebhookHandler()
+            mock_mgr.broadcast.assert_called_once()
+            payload = json.loads(mock_mgr.broadcast.call_args[0][0])
+            assert payload["alert_type"] == "CONCEALMENT"
+
+    async def test_deliver_skips_when_no_clients(self, sample_concealment_alert):
+        """WebSocketHandler skips broadcast when no clients are connected."""
+        handler = WebSocketHandler()
         envelope = AlertEnvelope.from_raw(sample_concealment_alert)
-        target = DeliveryTarget(type="webhook", url="")
+        target = DeliveryTarget(type="websocket")
 
-        with pytest.raises(ValueError, match="Webhook URL not configured"):
+        with patch("src.delivery.websocket.ws_manager") as mock_mgr:
+            mock_mgr.active_count = 0
+            mock_mgr.broadcast = AsyncMock()
+
             await handler.deliver(envelope, target)
+
+            mock_mgr.broadcast.assert_not_called()
 
 
 class TestMqttHandler:
@@ -134,12 +138,59 @@ class TestDeliveryRegistry:
         handler = get_handler("log")
         assert isinstance(handler, LogHandler)
 
-    def test_get_webhook_handler(self):
-        """Registry returns a WebhookHandler for type 'webhook'."""
-        handler = get_handler("webhook")
-        assert isinstance(handler, WebhookHandler)
+    def test_get_websocket_handler(self):
+        """Registry returns a WebSocketHandler for type 'websocket'."""
+        handler = get_handler("websocket")
+        assert isinstance(handler, WebSocketHandler)
 
     def test_unknown_handler_raises(self):
         """Registry raises ValueError for an unknown handler type."""
         with pytest.raises(ValueError, match="Unknown delivery type"):
             get_handler("carrier_pigeon")
+
+
+class TestConnectionManager:
+    async def test_connect_and_active_count(self):
+        """ConnectionManager increments active_count on connect."""
+        mgr = ConnectionManager()
+        ws = AsyncMock()
+        await mgr.connect(ws)
+        assert mgr.active_count == 1
+        ws.accept.assert_called_once()
+
+    async def test_disconnect(self):
+        """ConnectionManager decrements active_count on disconnect."""
+        mgr = ConnectionManager()
+        ws = AsyncMock()
+        await mgr.connect(ws)
+        mgr.disconnect(ws)
+        assert mgr.active_count == 0
+
+    async def test_broadcast_sends_to_all(self):
+        """ConnectionManager sends message to all connected clients."""
+        mgr = ConnectionManager()
+        ws1 = AsyncMock()
+        ws2 = AsyncMock()
+        await mgr.connect(ws1)
+        await mgr.connect(ws2)
+
+        await mgr.broadcast("hello")
+
+        ws1.send_text.assert_called_once_with("hello")
+        ws2.send_text.assert_called_once_with("hello")
+
+    async def test_broadcast_removes_dead_connections(self):
+        """ConnectionManager removes clients that raise on send."""
+        mgr = ConnectionManager()
+        ws_good = AsyncMock()
+        ws_dead = AsyncMock()
+        ws_dead.send_text.side_effect = RuntimeError("closed")
+
+        await mgr.connect(ws_good)
+        await mgr.connect(ws_dead)
+        assert mgr.active_count == 2
+
+        await mgr.broadcast("test")
+
+        assert mgr.active_count == 1
+        ws_good.send_text.assert_called_once_with("test")

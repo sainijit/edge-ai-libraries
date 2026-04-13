@@ -13,8 +13,7 @@ All settings can be controlled via `.env` (or real environment variables). Run `
 | `MQTT_PASSWORD` | `` | MQTT auth password (external mode only) |
 | `CONFIG_PATH` | `config/config.yaml` | Path to YAML config |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `WEBHOOK_URL` | `` | Default webhook URL |
-| `DELIVERY_HANDLERS` | `` | Comma-separated list of handlers (`log`, `mqtt`, `webhook`). When set, overrides the per-subscription `delivery` list in `config.yaml`. Leave empty to use YAML config. |
+| `DELIVERY_HANDLERS` | `` | Comma-separated list of handlers (`log`, `mqtt`, `websocket`). When set, overrides the per-subscription `delivery` list in `config.yaml`. Leave empty to use YAML config. |
 
 ---
 
@@ -69,7 +68,7 @@ DELIVERY_HANDLERS=log
 DELIVERY_HANDLERS=log,mqtt
 
 # All three handlers
-DELIVERY_HANDLERS=log,mqtt,webhook
+DELIVERY_HANDLERS=log,mqtt,websocket
 ```
 
 > **Priority:** If `DELIVERY_HANDLERS` is set, it applies to **all** subscriptions and the `delivery` arrays in `config.yaml` are ignored. If it is empty or unset, the YAML config is used as-is.
@@ -87,14 +86,15 @@ You will see lines like:
 ```
 alert-service  | ... [INFO] src.delivery.log: ALERT DELIVERED [CONCEALMENT]: ...
 alert-service  | ... [INFO] src.delivery.mqtt: MQTT published: alert_type=CONCEALMENT topic=alerts/concealment
-alert-service  | ... [INFO] src.delivery.webhook: Webhook delivered: alert_type=CONCEALMENT url=http://... status=200
+alert-service  | ... [INFO] src.delivery.websocket: WebSocket broadcast: alert_type=CONCEALMENT clients=1
 ```
 
 If a handler is not producing output, check:
 
 1. The subscription in `config/config.yaml` includes the handler's `type`.
-2. The related environment variables (e.g. `MQTT_HOST`, `WEBHOOK_URL`) are set in `.env`.
-3. The target service (MQTT broker, webhook endpoint) is reachable.
+2. The related environment variables (e.g. `MQTT_HOST`) are set in `.env`.
+3. The target service (MQTT broker) is reachable.
+4. For the WebSocket handler, at least one client is connected to `ws://localhost:8000/api/v1/ws`.
 
 ---
 
@@ -314,15 +314,161 @@ alert-service  | ... [INFO] src.delivery.mqtt: MQTT published: alert_type=CONCEA
 
 ## WebSocket Testing Guide
 
-The Mosquitto broker exposes an **MQTT-over-WebSocket** listener on **port 9001**. This allows browser-based and Python clients to subscribe to MQTT topics over WebSocket transport.
+The alert service exposes a native **WebSocket endpoint** at `ws://localhost:8000/api/v1/ws`. When the `websocket` delivery handler is enabled, every alert is broadcast as a JSON message to all connected WebSocket clients in real time.
 
-> **Note:** Tools like `websocat` or `wscat` will **not** work here — they speak raw WebSocket but Mosquitto expects the MQTT protocol layered on top of WebSocket. Use an MQTT client library with WebSocket transport instead.
+### Using `websocat` (CLI)
+
+```bash
+# Install websocat
+# Ubuntu/Debian:
+sudo apt-get install -y websocat
+# Or via cargo:
+cargo install websocat
+```
+
+Connect and listen for alerts:
+
+```bash
+# Terminal 1: connect to the WebSocket endpoint
+websocat ws://localhost:8000/api/v1/ws
+
+# Terminal 2: post an alert
+curl -X POST http://localhost:8000/api/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{"alert_type":"CONCEALMENT","metadata":{"poi_id":"person-001","camera_id":"cam-north-01"},"timestamp":"2025-01-15T10:30:00Z","source":"test"}'
+```
+
+**Expected output in Terminal 1:**
+
+```json
+{"alert_type": "CONCEALMENT", "metadata": {"poi_id": "person-001", "camera_id": "cam-north-01"}, "timestamp": "2025-01-15T10:30:00Z"}
+```
+
+### Using `wscat` (Node.js CLI)
+
+```bash
+npm install -g wscat
+```
+
+```bash
+# Terminal 1: connect
+wscat -c ws://localhost:8000/api/v1/ws
+
+# Terminal 2: post an alert (same curl command as above)
+```
+
+### Using Python (`websockets`)
+
+```bash
+pip install websockets
+```
+
+```python
+import asyncio
+import websockets
+
+async def listen():
+    async with websockets.connect("ws://localhost:8000/api/v1/ws") as ws:
+        print("Connected — waiting for alerts...")
+        async for message in ws:
+            print(f"Alert received: {message}")
+
+asyncio.run(listen())
+```
+
+Run it, then post an alert from another terminal:
+
+```bash
+# Terminal 1: start the WebSocket listener
+python3 ws_listener.py
+
+# Terminal 2: post an alert
+curl -X POST http://localhost:8000/api/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{"alert_type":"CONCEALMENT","metadata":{"poi_id":"person-001","camera_id":"cam-north-01"},"timestamp":"2025-01-15T10:30:00Z","source":"test"}'
+```
+
+### Using a Browser
+
+```html
+<script>
+  const ws = new WebSocket('ws://localhost:8000/api/v1/ws');
+  ws.onopen = () => console.log('Connected to alert service');
+  ws.onmessage = (event) => {
+    const alert = JSON.parse(event.data);
+    console.log('Alert received:', alert);
+  };
+  ws.onclose = () => console.log('Disconnected');
+</script>
+```
+
+### Verifying WebSocket Events
+
+**Step 1 — Start the service:**
+
+```bash
+make up
+```
+
+**Step 2 — Connect a WebSocket client:**
+
+```bash
+websocat ws://localhost:8000/api/v1/ws
+```
+
+**Step 3 — Confirm the connection in service logs:**
+
+```bash
+make logs
+```
+
+```
+alert-service  | ... [INFO] src.delivery.ws_manager: WebSocket client connected (1 total)
+```
+
+**Step 4 — Post an alert from another terminal:**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{"alert_type":"CONCEALMENT","metadata":{"poi_id":"person-001","camera_id":"cam-north-01"},"timestamp":"2025-01-15T10:30:00Z","source":"test"}'
+```
+
+**Step 5 — Check the WebSocket client output:**
+
+The `websocat` terminal should print the alert JSON:
+
+```json
+{"alert_type": "CONCEALMENT", "metadata": {"poi_id": "person-001", "camera_id": "cam-north-01"}, "timestamp": "2025-01-15T10:30:00Z"}
+```
+
+**Step 6 — Confirm broadcast in service logs:**
+
+```
+alert-service  | ... [INFO] src.delivery.websocket: WebSocket broadcast: alert_type=CONCEALMENT clients=1
+```
+
+**Step 7 — Disconnect and verify cleanup:**
+
+Close the `websocat` session (`Ctrl+C`). The service logs should show:
+
+```
+alert-service  | ... [INFO] src.delivery.ws_manager: WebSocket client disconnected (0 remaining)
+```
+
+If no WebSocket clients are connected when an alert is posted, the handler skips the broadcast silently (a debug-level log is emitted).
+
+---
+
+## MQTT-over-WebSocket Testing
+
+The Mosquitto broker also exposes an **MQTT-over-WebSocket** listener on **port 9001**. This is separate from the native WebSocket endpoint above — it allows MQTT clients to connect using WebSocket transport.
+
+> **Note:** Tools like `websocat` or `wscat` will **not** work with port 9001 — they speak raw WebSocket but Mosquitto expects the MQTT protocol layered on top. Use an MQTT client library with WebSocket transport instead.
 
 ### Using Python (`paho-mqtt` with WebSockets)
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install paho-mqtt
 ```
 
@@ -348,10 +494,8 @@ client.on_message = on_message
 client.loop_forever()
 ```
 
-Run it, then post an alert from another terminal:
-
 ```bash
-# Terminal 1: start the WebSocket subscriber
+# Terminal 1: start the MQTT-over-WebSocket subscriber
 python3 tests/ws_subscriber.py
 
 # Terminal 2: post an alert

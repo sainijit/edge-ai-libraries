@@ -35,10 +35,11 @@ class TestAlertEnvelope:
         assert len(envelope.timestamp) > 0
 
     def test_to_dict(self, sample_concealment_alert):
-        """to_dict returns the full envelope as a serialisable dict."""
+        """to_dict returns clean envelope without raw payload duplication."""
         envelope = AlertEnvelope.from_raw(sample_concealment_alert)
         result = envelope.to_dict()
 
         assert result["alert_type"] == "CONCEALMENT"
         assert result["metadata"]["poi_id"] == "person-001"
-        assert result["payload"] == sample_concealment_alert
+        assert result["timestamp"] == "2025-01-15T10:30:00Z"
+        assert "payload" not in result
