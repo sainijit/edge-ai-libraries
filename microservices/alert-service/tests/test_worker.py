@@ -35,6 +35,7 @@ def worker_config():
 
 class TestAlertWorker:
     async def test_worker_processes_alert(self, worker_config):
+        """Worker dequeues and processes a matching alert."""
         worker = AlertWorker(worker_config)
         await worker.start()
 
@@ -49,6 +50,7 @@ class TestAlertWorker:
         await worker.stop()
 
     async def test_worker_drops_unsubscribed_alert(self, worker_config):
+        """Worker drops alerts with no matching subscription."""
         worker = AlertWorker(worker_config)
         await worker.start()
 
@@ -62,6 +64,7 @@ class TestAlertWorker:
         await worker.stop()
 
     async def test_worker_retry_on_failure(self):
+        """Worker retries delivery when the handler raises an exception."""
         config = AppConfig(
             service=ServiceConfig(retry_attempts=2, retry_interval_seconds=0),
             subscriptions=[
@@ -93,6 +96,7 @@ class TestAlertWorker:
         await worker.stop()
 
     async def test_worker_start_stop(self, worker_config):
+        """Worker starts and stops cleanly with _running flag."""
         worker = AlertWorker(worker_config)
         await worker.start()
         assert worker._running is True

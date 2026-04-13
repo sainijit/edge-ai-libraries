@@ -10,6 +10,7 @@ from src.core.config import load_config
 
 class TestLoadConfig:
     def test_load_valid_config(self, config_file):
+        """Loads config with correct retry settings and subscription count."""
         config = load_config(config_file)
 
         assert config.service.retry_attempts == 2
@@ -17,6 +18,7 @@ class TestLoadConfig:
         assert len(config.subscriptions) == 3
 
     def test_concealment_subscription(self, config_file):
+        """Parses CONCEALMENT subscription with dedup fields and hash config."""
         config = load_config(config_file)
         sub = config.get_subscription("CONCEALMENT")
 
@@ -29,6 +31,7 @@ class TestLoadConfig:
         assert sub.dedup.hash.truncate == 16
 
     def test_intrusion_dedup_disabled(self, config_file):
+        """INTRUSION subscription has dedup disabled."""
         config = load_config(config_file)
         sub = config.get_subscription("INTRUSION")
 
@@ -36,14 +39,17 @@ class TestLoadConfig:
         assert sub.dedup.enabled is False
 
     def test_unknown_subscription_returns_none(self, config_file):
+        """Looking up a non-existent subscription returns None."""
         config = load_config(config_file)
         assert config.get_subscription("NONEXISTENT") is None
 
     def test_missing_config_file_raises(self, tmp_path):
+        """Raises FileNotFoundError for a missing YAML file."""
         with pytest.raises(FileNotFoundError):
             load_config(str(tmp_path / "nonexistent.yaml"))
 
     def test_env_var_resolution(self, tmp_path):
+        """Resolves ${ENV_VAR} placeholders in YAML values."""
         os.environ["TEST_WEBHOOK_URL"] = "http://example.com/hook"
         saved_dh = os.environ.pop("DELIVERY_HANDLERS", None)
         yaml_content = """\

@@ -9,6 +9,7 @@ import pytest
 
 class TestHealthEndpoint:
     async def test_health(self, app_client):
+        """Returns 200 with status healthy."""
         response = await app_client.get("/api/v1/health")
         assert response.status_code == 200
         data = response.json()
@@ -19,6 +20,7 @@ class TestAlertIngestion:
     async def test_accept_concealment_alert(
         self, app_client, sample_concealment_alert
     ):
+        """Accepts a CONCEALMENT alert and returns accepted status."""
         response = await app_client.post(
             "/api/v1/alerts", json=sample_concealment_alert
         )
@@ -30,6 +32,7 @@ class TestAlertIngestion:
     async def test_accept_loitering_alert(
         self, app_client, sample_loitering_alert
     ):
+        """Accepts a LOITERING alert and returns accepted status."""
         response = await app_client.post(
             "/api/v1/alerts", json=sample_loitering_alert
         )
@@ -41,6 +44,7 @@ class TestAlertIngestion:
     async def test_accept_intrusion_alert(
         self, app_client, sample_intrusion_alert
     ):
+        """Accepts an INTRUSION alert and returns accepted status."""
         response = await app_client.post(
             "/api/v1/alerts", json=sample_intrusion_alert
         )
@@ -50,6 +54,7 @@ class TestAlertIngestion:
         assert data["alert_type"] == "INTRUSION"
 
     async def test_accept_unknown_alert_type(self, app_client):
+        """Accepts an unrecognised alert type gracefully."""
         response = await app_client.post(
             "/api/v1/alerts",
             json={"alert_type": "UNKNOWN_TYPE", "metadata": {}},
@@ -59,6 +64,7 @@ class TestAlertIngestion:
         assert data["status"] == "accepted"
 
     async def test_accept_minimal_payload(self, app_client):
+        """Accepts a payload without alert_type, defaulting to UNKNOWN."""
         response = await app_client.post(
             "/api/v1/alerts", json={"foo": "bar"}
         )

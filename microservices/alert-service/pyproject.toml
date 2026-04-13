@@ -35,6 +35,8 @@ line_length = 88
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "--spec"
+spec_test_format = "{docstring_summary}"
 markers = [
     "unit: Unit tests",
     "integration: Integration tests",
