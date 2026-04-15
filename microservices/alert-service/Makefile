@@ -52,16 +52,23 @@ init-env:
 	fi
 
 ## ── Tests ──────────────────────────────────────────────
-test:
-	pip install -q -r requirements.txt pytest pytest-asyncio pytest-cov httpx respx
-	pytest tests/ -v --tb=short
+VENV     := .venv
+PIP      := $(VENV)/bin/pip
+PYTEST   := $(VENV)/bin/pytest
 
-coverage:
-	pip install -q -r requirements.txt pytest pytest-asyncio pytest-cov httpx respx coverage
-	pytest tests/ -v --tb=short --cov=src --cov-report=term-missing:skip-covered
+$(VENV):
+	python3 -m venv $(VENV)
+
+test: $(VENV)
+	$(PIP) install -q -r requirements.txt pytest pytest-asyncio pytest-cov httpx respx pytest-spec
+	$(PYTEST) tests/ -v --tb=short
+
+coverage: $(VENV)
+	$(PIP) install -q -r requirements.txt pytest pytest-asyncio pytest-cov httpx respx pytest-spec coverage
+	$(PYTEST) tests/ -v --tb=short --cov=src --cov-report=term-missing:skip-covered
 
 coverage-html: coverage
-	coverage html
+	$(VENV)/bin/coverage html
 	@echo "Coverage report: open htmlcov/index.html"
 
 ## ── Cleanup ────────────────────────────────────────────

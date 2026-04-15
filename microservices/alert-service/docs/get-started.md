@@ -6,14 +6,13 @@
 |---|---|
 | Docker | 24+ |
 | Docker Compose | v2 plugin (`docker compose`) |
-| GNU Make | 3.81+ |
 
 ---
 
 ## 1. Clone & Navigate
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/open-edge-platform/edge-ai-libraries.git
 cd edge-ai-libraries/microservices/alert-service
 ```
 
@@ -38,6 +37,10 @@ make logs            # tail container logs
 make down            # stop & remove containers
 ```
 
+Instead of building locally, you can directly use the official Docker image:
+docker pull intel/alert-service:0.0.1
+
+
 ---
 
 ## 4. Verify
@@ -49,7 +52,7 @@ curl http://localhost:8000/api/v1/health
 # Post an alert
 curl -X POST http://localhost:8000/api/v1/alerts \
   -H "Content-Type: application/json" \
-  -d '{"alert_type":"test","metadata":{"zone":"A"},"payload":{"msg":"hello"}}'
+  -d '{"alert_type":"CONCEALMENT","metadata":{"poi_id":"person-001","camera_id":"cam-north-01"},"timestamp":"2025-01-15T10:30:00Z"}'
 ```
 
 ---
@@ -106,7 +109,7 @@ pytest
 curl -X POST http://localhost:8000/api/v1/alerts \
   -H "Content-Type: application/json" \
   -d '{
-    "alert_type": "intrusion",
+    "alert_type": "INTRUSION",
     "metadata": {
       "camera_id": "cam-01",
       "zone": "entrance"
@@ -123,8 +126,10 @@ curl -X POST http://localhost:8000/api/v1/alerts \
 ```bash
 curl -X POST http://localhost:8000/api/v1/alerts \
   -H "Content-Type: application/json" \
-  -d '{"alert_type":"test"}'
+  -d '{"alert_type":"LOITERING","metadata":{"zone_id":"zone-5"}}'
 ```
+
+> **Note:** `alert_type` matching is **case-sensitive**. The value must exactly match the subscription name in `config/config.yaml` (e.g. `INTRUSION`, not `intrusion`).
 
 ### Health check
 

@@ -111,6 +111,8 @@ The alert service includes an in-memory, TTL-based deduplication engine that pre
 
 ### Per-Subscription Configuration
 
+> **Note:** `alert_type` matching is **case-sensitive**. The value in the incoming alert must exactly match the subscription name (e.g. `CONCEALMENT`, not `concealment`).
+
 Deduplication is configured **per subscription** in `config/config.yaml`:
 
 ```yaml
