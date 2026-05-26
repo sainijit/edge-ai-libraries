@@ -44,7 +44,7 @@ logger = logging.getLogger()
 REST_API_ROOT_PATH = os.getenv('REST_API_ROOT_PATH', '/')
 app = FastAPI(root_path=REST_API_ROOT_PATH)
 
-KAPACITOR_URL = os.getenv('KAPACITOR_URL', 'http://localhost:9092')
+KAPACITOR_URL = os.getenv('KAPACITOR_URL', 'http://localhost:9092').rstrip('/')
 CONFIG_FILE = "/app/config.json"
 MAX_SIZE = 5 * 1024  # 5 KB
 MAX_UPLOAD_SIZE = int(os.getenv('UDF_MAX_FILE_SIZE_MB', 100)) * 1024 * 1024  # 100 MB — max allowed tar upload
@@ -253,8 +253,9 @@ async def receive_alert(alert: OpcuaAlertsMessage):
     try:
         if "alerts" in config.keys() and "opcua" in config["alerts"].keys():
             try:
+                configured_opcua_server = config["alerts"]["opcua"]["opcua_server"]
                 if OPCUA_SEND_ALERT is None or \
-                    OPCUA_SEND_ALERT.opcua_server != config["alerts"]["opcua"]["opcua_server"] or \
+                    OPCUA_SEND_ALERT.configured_opcua_server != configured_opcua_server or \
                     not (await OPCUA_SEND_ALERT.is_connected()):
                     logger.info("Initializing OPC UA client for sending alerts")
                     OPCUA_SEND_ALERT = OpcuaAlerts(config)
