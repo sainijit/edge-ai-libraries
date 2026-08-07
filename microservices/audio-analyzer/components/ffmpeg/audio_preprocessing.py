@@ -22,6 +22,8 @@ os.makedirs(CHUNKS_DIR, exist_ok=True)
 
 DENOISE = getattr(config.audio_preprocessing, "denoise", False)
 DENOISE_MODEL = getattr(config.audio_preprocessing, "denoise_model", "")
+NORMALIZE = getattr(config.audio_preprocessing, "normalize", False)
+NORMALIZE_FILTER = getattr(config.audio_preprocessing, "normalize_filter", "dynaudnorm")
 
 FFMPEG_PROCESSES = {}
 
@@ -85,14 +87,27 @@ def get_closest_silence(silences, target_time, window=SEARCH_WINDOW):
     return closest  # None if nothing close enough
 
 def _build_af_filter() -> list[str]:
-    """Return ffmpeg -af args for RNNoise denoising, or empty list if disabled."""
-    if not DENOISE:
+    """Return ffmpeg -af args for denoise + loudness normalization, in that
+    order (denoise first so normalization doesn't amplify noise), or an
+    empty list if both are disabled.
+
+    Denoise backend selection: ffmpeg's `arnndn` (RNNoise) filter has no
+    built-in default model — it requires an explicit model file via `m=`,
+    and fails to initialize (breaking every chunk) if one isn't provided.
+    No `.rnnn` model ships with this repo/image, so when `denoise_model` is
+    not configured we fall back to `afftdn` (FFT-based adaptive denoiser),
+    which requires no external model and ships with ffmpeg itself. If an
+    operator supplies `denoise_model`, `arnndn` is used since it generally
+    outperforms `afftdn` on speech when a trained model is available.
+    """
+    filters = []
+    if DENOISE:
+        filters.append(f"arnndn=m={DENOISE_MODEL}" if DENOISE_MODEL else "afftdn")
+    if NORMALIZE and NORMALIZE_FILTER:
+        filters.append(NORMALIZE_FILTER)
+    if not filters:
         return []
-    if DENOISE_MODEL:
-        af = f"arnndn=m={DENOISE_MODEL}"
-    else:
-        af = "arnndn"
-    return ["-af", af]
+    return ["-af", ",".join(filters)]
 
 
 def _resolve_chunks_dir(session_id: str | None = None) -> str:
@@ -126,7 +141,11 @@ def process_audio_segment(audio_path, start_time, end_time, chunk_index, session
         )
     if not os.path.isfile(chunk_path):
         raise FileNotFoundError(f"Chunk file was not created: {chunk_path}")
-    logger.debug(f"Chunk {chunk_index} saved: {chunk_path}")
+    chunk_duration = end_time - start_time
+    logger.info(
+        "Chunk %d saved: %s (start=%.2fs end=%.2fs duration=%.2fs)",
+        chunk_index, chunk_path, start_time, end_time, chunk_duration,
+    )
     return {
         "chunk_path": chunk_path,
         "start_time": start_time,
@@ -141,12 +160,27 @@ def chunk_audio_by_silence(audio_path, session_id: str | None = None):
         )
     duration = get_audio_duration(audio_path)
     silences = detect_silences(audio_path)
+    logger.info(
+        "Silence detection: %d silence window(s) found in %.2fs of audio (threshold=%sdB, min_duration=%ss)",
+        len(silences), duration, SILENCE_THRESH, SILENCE_DURATION,
+    )
     current_time, chunk_index = 0.0, 0
     while current_time < duration:
         ideal_end = current_time + CHUNK_DURATION
-        end_time = get_closest_silence(silences, ideal_end) or min(ideal_end, duration)
+        snapped_end = get_closest_silence(silences, ideal_end)
+        end_time = snapped_end or min(ideal_end, duration)
         if end_time <= current_time:
             end_time = min(ideal_end, duration)
+        if snapped_end is None and end_time < duration:
+            logger.debug(
+                "Chunk %d: no silence found near ideal boundary %.2fs (window=%ss) — hard-cutting at %.2fs",
+                chunk_index, ideal_end, SEARCH_WINDOW, end_time,
+            )
+        else:
+            logger.debug(
+                "Chunk %d: boundary snapped to silence at %.2fs (ideal was %.2fs)",
+                chunk_index, end_time, ideal_end,
+            )
         yield process_audio_segment(audio_path, current_time, end_time, chunk_index, session_id=session_id)
         current_time = end_time
         chunk_index += 1

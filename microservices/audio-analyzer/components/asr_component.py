@@ -154,7 +154,17 @@ class ASRComponent(PipelineComponent):
                     temperature=self.temperature,
                     language=language,
                 )
-                asr_latency.record((time.monotonic() - _t0) * 1000)
+                elapsed_ms = (time.monotonic() - _t0) * 1000
+                asr_latency.record(elapsed_ms)
+                chunk_duration = float(chunk_data.get("end_time", 0.0)) - float(chunk_data.get("start_time", 0.0))
+                logger.info(
+                    "[ASR] session=%s chunk=%d duration=%.2fs latency=%.1fms language=%s",
+                    self.session_id,
+                    chunk_data.get("chunk_index", -1),
+                    chunk_duration,
+                    elapsed_ms,
+                    transcription.get("language"),
+                )
 
                 ui_segments = []
                 transcribed_text = ""

@@ -74,8 +74,30 @@ class PyannoteDiarizer:
         self._primary_embeddings: dict[str, np.ndarray] = {}
         # session_id → monotonic timestamp of last use (for TTL eviction)
         self._enrollment_last_used: dict[str, float] = {}
+        # session_id → consecutive chunks in which every segment was rejected.
+        # A healthy enrollment never rejects the customer many turns in a row,
+        # so a sustained streak is evidence the reference itself is bad.
+        self._rejection_streak: dict[str, int] = {}
         self.enrollment_ttl_seconds = float(
             getattr(diar_cfg, "enrollment_ttl_seconds", 1800.0)
+        )
+        # Consecutive fully-rejected chunks tolerated before the enrolled
+        # reference is discarded and re-derived from current audio. Without
+        # this, one weak enrollment silently drops every later utterance for
+        # the whole TTL window.
+        self.max_consecutive_rejections = int(
+            getattr(diar_cfg, "max_consecutive_rejections", 2)
+        )
+        # EMA weight applied to a confidently-matching observation when
+        # updating the reference. 0 disables adaptation. Keeps the reference
+        # representative as the speaker's level and distance drift.
+        self.enrollment_adapt_rate = float(
+            getattr(diar_cfg, "enrollment_adapt_rate", 0.15)
+        )
+        # Similarity margin above the match threshold required before an
+        # observation is trusted enough to adapt the reference.
+        self.enrollment_adapt_margin = float(
+            getattr(diar_cfg, "enrollment_adapt_margin", 0.10)
         )
         # Minimum span used to classify a speaker. Embeddings computed on much
         # less audio than this are unstable, so words are grouped into windows
@@ -103,9 +125,11 @@ class PyannoteDiarizer:
         if session_id is None:
             self._primary_embeddings.clear()
             self._enrollment_last_used.clear()
+            self._rejection_streak.clear()
         else:
             self._primary_embeddings.pop(session_id, None)
             self._enrollment_last_used.pop(session_id, None)
+            self._rejection_streak.pop(session_id, None)
 
     def _evict_stale_enrollments(self) -> None:
         """Drop enrolled voices unused for longer than the TTL.
@@ -125,6 +149,7 @@ class PyannoteDiarizer:
         for key in stale:
             self._primary_embeddings.pop(key, None)
             self._enrollment_last_used.pop(key, None)
+            self._rejection_streak.pop(key, None)
         if stale:
             logger.info(
                 "[DIARIZATION][ENROLL] evicted %d stale enrollment(s) after %.0fs idle",
@@ -297,6 +322,7 @@ class PyannoteDiarizer:
         sample_rate: int,
         primary_embedding: np.ndarray,
         session_key: str,
+        match_sink: list[tuple[float, np.ndarray]] | None = None,
     ) -> list[dict]:
         """Split one Whisper segment wherever the speaking voice changes.
 
@@ -312,6 +338,9 @@ class PyannoteDiarizer:
             sample_rate: sample rate of ``waveform``.
             primary_embedding: L2-normalized enrolled reference voice.
             session_key: enrollment scope, for logging only.
+            match_sink: optional accumulator receiving
+                ``(similarity, embedding)`` for every window that matched the
+                primary, so the caller can adapt the reference.
 
         Returns:
             One sub-segment per contiguous run of same-speaker words, each
@@ -340,6 +369,8 @@ class PyannoteDiarizer:
             else:
                 similarity = self._cosine(embedding, primary_embedding)
                 verdict = self._label_for(similarity)
+                if match_sink is not None and verdict == "SPEAKER_00":
+                    match_sink.append((similarity, embedding))
             logger.info(
                 "[DIARIZATION][MATCH] session=%s window [%.2fs-%.2fs] "
                 "cos_sim=%.3f threshold=%.2f -> %s",
@@ -381,6 +412,84 @@ class PyannoteDiarizer:
             labelled["speaker"] = "SPEAKER_00"
             return [labelled]
         return sub_segments
+
+    def _reconcile_rejections(
+        self,
+        sub_segments: list[dict],
+        waveform: torch.Tensor,
+        sample_rate: int,
+        whisper_segments: list[dict],
+        session_key: str,
+    ) -> list[dict]:
+        """Recover from an unreliable enrollment that rejects all speech.
+
+        A correct reference occasionally rejects a chunk (a bystander speaks,
+        or the customer is off-mic). It does not reject *every* chunk in a row:
+        at a kiosk the customer is almost always the one talking. A sustained
+        all-rejected streak is therefore far better explained by a bad
+        reference — typically enrolled from a marginal, noisy opening span —
+        than by the customer having fallen silent for the rest of the order.
+
+        Because the reference is cached per conversation, that state is
+        absorbing without this check: every later utterance is dropped and the
+        agent keeps replying with its generic greeting. Re-enrolling from
+        current audio makes the failure self-correcting, and the triggering
+        utterance is relabelled primary so it is answered rather than lost.
+
+        Args:
+            sub_segments: labelled sub-segments for this chunk.
+            waveform: ``(channel, time)`` float32 tensor.
+            sample_rate: sample rate of ``waveform``.
+            whisper_segments: original segments, used as enrollment candidates.
+            session_key: conversation-scoped enrollment key.
+
+        Returns:
+            ``sub_segments``, relabelled as primary when re-enrollment fired.
+        """
+        if not sub_segments:
+            return sub_segments
+        if any(seg.get("speaker") == "SPEAKER_00" for seg in sub_segments):
+            # Reference is behaving — clear the streak.
+            self._rejection_streak[session_key] = 0
+            return sub_segments
+
+        streak = self._rejection_streak.get(session_key, 0) + 1
+        self._rejection_streak[session_key] = streak
+        logger.info(
+            "[DIARIZATION][ENROLL] session=%s all %d segment(s) rejected as "
+            "non-primary (streak=%d/%d)",
+            session_key, len(sub_segments), streak, self.max_consecutive_rejections,
+        )
+        if self.max_consecutive_rejections <= 0 or streak < self.max_consecutive_rejections:
+            return sub_segments
+
+        logger.warning(
+            "[DIARIZATION][ENROLL] session=%s enrolled reference rejected %d "
+            "consecutive chunk(s); treating it as unreliable and re-enrolling "
+            "from current audio",
+            session_key, streak,
+        )
+        self._primary_embeddings.pop(session_key, None)
+        # Relax the duration floor: the strict floor is what produced the poor
+        # reference (or no reference) in the first place, and staying locked
+        # out is worse than enrolling from a slightly shorter span.
+        relaxed = max(self.min_window_seconds, self.min_enrollment_duration * 0.5)
+        re_enrolled = self._enroll_from_segments(
+            waveform, sample_rate, whisper_segments, session_key,
+            min_duration=relaxed, reason="re-enrollment after rejection streak",
+        )
+        if re_enrolled is None:
+            logger.info(
+                "[DIARIZATION][ENROLL] session=%s re-enrollment found no usable "
+                "span; keeping segments as-is",
+                session_key,
+            )
+            return sub_segments
+
+        self._rejection_streak[session_key] = 0
+        # The utterance the new reference was derived from is by construction
+        # the primary speaker, so surface it instead of dropping it.
+        return [{**seg, "speaker": "SPEAKER_00"} for seg in sub_segments]
 
     def _label_for(self, similarity: float) -> str:
         """Map a cosine similarity to a speaker label.
@@ -444,6 +553,39 @@ class PyannoteDiarizer:
             self._enrollment_last_used[session_key] = time.monotonic()
             return existing
 
+        return self._enroll_from_segments(
+            waveform, sample_rate, segments, session_key
+        )
+
+    def _enroll_from_segments(
+        self,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        segments: list[dict],
+        session_key: str,
+        min_duration: float | None = None,
+        reason: str = "first speech",
+    ) -> np.ndarray | None:
+        """Derive and store the reference voice from ``segments``.
+
+        Unconditionally overwrites any existing reference for ``session_key``,
+        so it also serves re-enrollment after the current reference is judged
+        unreliable.
+
+        Args:
+            waveform: ``(channel, time)`` float32 tensor.
+            sample_rate: sample rate of ``waveform``.
+            segments: candidate segments, earliest first.
+            session_key: conversation-scoped enrollment key.
+            min_duration: minimum enrollable span; defaults to
+                ``min_enrollment_duration``.
+            reason: why enrollment ran, for logging.
+
+        Returns:
+            The stored L2-normalized embedding, or ``None`` when no segment
+            yielded a long enough, embeddable span.
+        """
+        floor = self.min_enrollment_duration if min_duration is None else min_duration
         for segment in segments:
             start_s = float(segment.get("start", 0.0))
             end_s = float(segment.get("end", 0.0))
@@ -460,26 +602,62 @@ class PyannoteDiarizer:
                 end_s = enroll_end
             else:
                 end_s = min(end_s, start_s + self.enrollment_window_seconds)
-            if end_s - start_s < self.min_enrollment_duration:
+            if end_s - start_s < floor:
                 continue
             embedding = self._extract_embedding(waveform, sample_rate, start_s, end_s)
             if embedding is None:
                 continue
             self._primary_embeddings[session_key] = embedding
             self._enrollment_last_used[session_key] = time.monotonic()
+            self._rejection_streak[session_key] = 0
             logger.info(
                 "[DIARIZATION][ENROLL] session=%s enrolled primary speaker "
-                "from [%.2fs-%.2fs] duration=%.2fs",
-                session_key, start_s, end_s, end_s - start_s,
+                "from [%.2fs-%.2fs] duration=%.2fs (%s)",
+                session_key, start_s, end_s, end_s - start_s, reason,
             )
             return embedding
 
         logger.info(
             "[DIARIZATION][ENROLL] session=%s no span >=%.2fs with a valid "
             "embedding; deferring enrollment",
-            session_key, self.min_enrollment_duration,
+            session_key, floor,
         )
         return None
+
+    def _adapt_primary_embedding(
+        self,
+        session_key: str,
+        observation: np.ndarray,
+        similarity: float,
+    ) -> None:
+        """Blend a confidently-matching observation into the reference.
+
+        Standard speaker-verification centroid adaptation: the reference is
+        enrolled from a couple of seconds of speech, so it only weakly
+        represents the speaker. Folding in high-confidence matches makes it
+        progressively more robust instead of freezing the initial estimate for
+        the whole conversation.
+
+        Only observations comfortably above the match threshold are used, so
+        an impostor accepted near the boundary cannot drag the reference.
+        """
+        if self.enrollment_adapt_rate <= 0.0:
+            return
+        if similarity < self.voice_match_threshold + self.enrollment_adapt_margin:
+            return
+        reference = self._primary_embeddings.get(session_key)
+        if reference is None:
+            return
+        rate = min(1.0, self.enrollment_adapt_rate)
+        blended = (1.0 - rate) * reference + rate * observation
+        norm = np.linalg.norm(blended)
+        if norm < 1e-8:
+            return
+        self._primary_embeddings[session_key] = (blended / norm).astype(np.float32)
+        logger.debug(
+            "[DIARIZATION][ENROLL] session=%s reference adapted (cos_sim=%.3f rate=%.2f)",
+            session_key, similarity, rate,
+        )
 
     def split_and_label_segments(
         self,
@@ -520,16 +698,42 @@ class PyannoteDiarizer:
                 waveform_tensor, sample_rate, whisper_segments, session_key
             )
             if primary_embedding is None:
-                return whisper_segments
+                # No reference voice yet, so there is no evidence on which to
+                # reject anyone. Absence of a verdict must not be reported as a
+                # negative verdict, or the opening utterance is dropped and the
+                # speaker never gets locked. Mirrors the NaN rule in
+                # _label_for: missing evidence resolves to primary.
+                logger.info(
+                    "[DIARIZATION] session=%s enrollment deferred — treating "
+                    "%d segment(s) as primary (no reference to reject against)",
+                    session_key, len(whisper_segments),
+                )
+                return [
+                    {**segment, "speaker": "SPEAKER_00"}
+                    for segment in whisper_segments
+                ]
 
+            matches: list[tuple[float, np.ndarray]] = []
             sub_segments: list[dict] = []
             for segment in whisper_segments:
                 sub_segments.extend(
                     self._split_segment_by_voice(
                         segment, waveform_tensor, sample_rate,
-                        primary_embedding, session_key,
+                        primary_embedding, session_key, matches,
                     )
                 )
+
+            sub_segments = self._reconcile_rejections(
+                sub_segments, waveform_tensor, sample_rate,
+                whisper_segments, session_key,
+            )
+
+            if matches:
+                # Adapt from the strongest match only — the most reliable
+                # evidence in the chunk.
+                similarity, observation = max(matches, key=lambda item: item[0])
+                self._adapt_primary_embedding(session_key, observation, similarity)
+
             logger.info(
                 "[DIARIZATION] session=%s voice split %d whisper segment(s) into "
                 "%d sub-segment(s) elapsed=%.0fms",

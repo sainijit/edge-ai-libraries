@@ -19,15 +19,23 @@ models:
     # whispercpp derives the same values from per-token plog and ptsum.
     # openvino genai pipelines do not expose these fields; filtering is skipped.
     #
-    # Values below are tuned for live microphone input (noisy environment).
+    # Values below were re-tuned after enabling audio_preprocessing.denoise
+    # (RNNoise). With denoising active, background noise is far less likely to
+    # be mistaken for speech, so these thresholds were relaxed from the
+    # previous "live noisy microphone" preset toward openai-whisper's own
+    # defaults (no_speech_threshold=0.6, logprob_threshold=-1.0) — but not
+    # all the way, since some live-mic margin is still warranted. This
+    # reduces false-positive drops of short/quiet real speech (previously the
+    # stricter values were more likely to discard legitimate short utterances
+    # as "silence").
     # Lower no_speech_threshold → stricter: flags more segments as potential noise.
     # Higher logprob_threshold  → stricter: drops low-confidence transcriptions.
     # Higher min_duration_sec / min_words → harder for noise bursts to earn the
     #   "definitely speech, keep" safety net in _is_silent_segment().
-    no_speech_threshold: 0.3
-    logprob_threshold: -0.3
-    min_duration_sec: 0.5
-    min_words: 2
+    no_speech_threshold: 0.5
+    logprob_threshold: -0.6
+    min_duration_sec: 0.3
+    min_words: 1
 
     # openai-whisper transcribe() native param: skip generation over silent
     # regions longer than this many seconds.  Directly targets the
@@ -43,10 +51,18 @@ models:
 
     # Decoder controls — beam_size/best_of apply to openai and whispercpp.
     # word_timestamps and threads are whisper.cpp specific.
-    beam_size: 1
+    # beam_size=3 enables real beam search (was 1 = greedy no-op); trades a
+    # small amount of latency for improved decoding accuracy on ambiguous audio.
+    beam_size: 3
     best_of: 1
     word_timestamps: false
     threads: 0
+
+    # openai-whisper's own robustness mechanism: retries decoding at
+    # increasing temperature when the compression_ratio/logprob checks judge
+    # the previous attempt low-confidence, instead of committing to a single
+    # (often 0.0/greedy) decode. See components/asr/openai/whisper.py.
+    temperature_fallback: true
 
   diarization: # Only applicable when models.asr.diarization is set to True
     provider: "huggingface"
@@ -70,10 +86,40 @@ audio_preprocessing:
   chunk_duration_sec: 15
   silence_threshold: -35  # in dB
   silence_duration: 0.3   # minimum silence length in seconds
-  search_window_sec: 1    # how far to look for silence if no silence exactly at chunk boundary
+  # How far to look for a real silence gap if none falls exactly at the ideal
+  # chunk boundary. Widened from 1s -> 2s so a hard cut (which can land
+  # mid-word) is less likely when speech is continuous near the 15s mark.
+  search_window_sec: 2
   chunk_output_path: chunks/
-  denoise: false          # set true for noisy mic/field audio (applies ffmpeg arnndn RNNoise filter)
-  denoise_model: ""       # path to .rnnn model file; leave empty to use ffmpeg built-in arnndn
+  denoise: true           # applies an ffmpeg denoise filter before chunking/ASR.
+                           # Enabled: reduces background/room noise, which both
+                           # improves ASR accuracy directly and makes the
+                           # silencedetect-based chunk boundary above more
+                           # reliable (noise floor no longer masks real pauses).
+  denoise_model: ""       # path to .rnnn RNNoise model file (arnndn filter).
+                           # IMPORTANT: ffmpeg's arnndn filter has NO built-in
+                           # default model and fails to initialize without one
+                           # (verified: `arnndn` alone raises "Error
+                           # initializing filters"). No .rnnn model ships with
+                           # this repo/image, so when this is left empty the
+                           # denoise stage uses `afftdn` (ffmpeg's model-free
+                           # FFT denoiser) instead. Set this to a valid .rnnn
+                           # path to opt into arnndn/RNNoise, which generally
+                           # performs better on speech when a trained model
+                           # is available.
+
+  # Per-chunk loudness normalization, applied after denoise and before the
+  # chunk is handed to ASR. dynaudnorm is used (not loudnorm/EBU R128)
+  # because each 15s chunk is processed independently with no shared
+  # analysis pass across a session — dynaudnorm is a single-pass, frame-local
+  # adaptive-gain filter designed for exactly this streaming/short-buffer
+  # case, whereas loudnorm's single-pass mode assumes a fixed/default input
+  # loudness and its accurate mode requires a separate two-pass measurement
+  # over the *whole* file, which does not fit this per-chunk pipeline and
+  # would cause inconsistent loudness jumps between independently-normalized
+  # chunks.
+  normalize: true
+  normalize_filter: dynaudnorm
 
 audio_util:
   max_size_mb: 200

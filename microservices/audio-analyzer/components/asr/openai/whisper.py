@@ -46,6 +46,30 @@ class Whisper(BaseASR):
         # openai-whisper's DecodingOptions has no repetition_penalty field —
         # passing it as a kwarg raises TypeError.  Applied as post-processing.
         self.REPETITION_PENALTY = getattr(config.models.asr, "repetition_penalty", 1.0)
+        # When enabled, transcribe() passes whisper a temperature *schedule*
+        # instead of a single scalar, restoring openai-whisper's built-in
+        # decode-and-retry mechanism: it retries at the next, higher
+        # temperature only when compression_ratio/logprob checks judge the
+        # previous attempt low-confidence. Previously a single float was
+        # passed (effectively always temperature=0.0/greedy with no retry),
+        # which silently disabled this robustness mechanism.
+        self.TEMPERATURE_FALLBACK = bool(getattr(config.models.asr, "temperature_fallback", True))
+        # Caps how many escalating-temperature retries whisper.transcribe()
+        # may make (the built-in ladder is 6 steps: 0.0, 0.2, ... 1.0). On
+        # genuinely short/choppy live-mic audio, letting it run the full
+        # ladder was observed to cost up to ~6x the normal decode latency
+        # (2.5s -> 17.5s for a single kiosk turn) while still producing a
+        # wrong transcript at the end — the later, higher-temperature
+        # attempts sample more randomly and are not more likely to recover
+        # the correct words on audio that is short/ambiguous by nature, they
+        # just cost more time. Capping bounds the worst case while still
+        # allowing one retry for the genuinely-recoverable "one bad decode"
+        # case. Default of 2 matches the (0.0, 0.2) prefix of the original
+        # ladder; set higher to trade latency back for more retry attempts,
+        # or equal to 6 to restore the original unbounded behaviour.
+        self.TEMPERATURE_FALLBACK_MAX_RETRIES = max(
+            1, int(getattr(config.models.asr, "temperature_fallback_max_retries", 2) or 2)
+        )
         # Native whisper param: skip generation over silent regions > N seconds.
         # null/None disables it.
         _hst = getattr(config.models.asr, "hallucination_silence_threshold", None)
@@ -136,6 +160,35 @@ class Whisper(BaseASR):
                 prev_text = text
         return deduped
 
+    def _temperature_schedule(self, base_temperature: float):
+        """Build the temperature argument passed to whisper's transcribe().
+
+        When TEMPERATURE_FALLBACK is enabled, returns a tuple starting at
+        `base_temperature` and stepping by 0.2, capped at
+        `TEMPERATURE_FALLBACK_MAX_RETRIES` steps (openai-whisper's own
+        default retry ladder runs the full 6 steps to 1.0). whisper.transcribe()
+        tries each temperature in order and only advances to the next one
+        when the compression_ratio/logprob checks judge the current attempt
+        low-confidence, so well-recognized audio still decodes once at
+        `base_temperature` with no extra cost — the cap only bounds the
+        worst case for genuinely low-confidence audio, where the full ladder
+        was observed to cost up to 6x normal latency without producing a
+        better transcript.
+
+        When disabled, returns `base_temperature` unchanged (single decode,
+        previous behaviour) — useful for reproducible output or benchmarking.
+        """
+        if not self.TEMPERATURE_FALLBACK:
+            return base_temperature
+
+        start = base_temperature if base_temperature is not None else 0.0
+        schedule = []
+        t = round(start, 2)
+        while t <= 1.0 + 1e-6 and len(schedule) < self.TEMPERATURE_FALLBACK_MAX_RETRIES:
+            schedule.append(round(t, 2))
+            t += 0.2
+        return tuple(schedule) if schedule else (start,)
+
     def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None) -> Dict[str, Any]:
         """
         Transcribe audio with strong silence suppression and zero speech loss.
@@ -148,7 +201,7 @@ class Whisper(BaseASR):
         # kept but our stricter multi-signal check rejects.
         result = self.model.transcribe(
             audio_path,
-            temperature=temperature,
+            temperature=self._temperature_schedule(temperature),
             language=language,
             condition_on_previous_text=False,
             no_speech_threshold=self.NO_SPEECH_THRESHOLD,
@@ -176,7 +229,22 @@ class Whisper(BaseASR):
         for seg in result.get("segments", []):
             if self._is_silent_segment(seg):
                 dropped += 1
+                logger.debug(
+                    "openai-whisper: dropped segment [%.2fs-%.2fs] no_speech_prob=%.3f "
+                    "avg_logprob=%.3f text=%r",
+                    float(seg.get("start", 0.0)), float(seg.get("end", 0.0)),
+                    seg.get("no_speech_prob", 0.0), seg.get("avg_logprob", 0.0),
+                    seg.get("text", "").strip()[:80],
+                )
                 continue
+
+            logger.debug(
+                "openai-whisper: kept segment [%.2fs-%.2fs] no_speech_prob=%.3f "
+                "avg_logprob=%.3f compression_ratio=%.3f",
+                float(seg.get("start", 0.0)), float(seg.get("end", 0.0)),
+                seg.get("no_speech_prob", 0.0), seg.get("avg_logprob", 0.0),
+                seg.get("compression_ratio", 0.0),
+            )
 
             kept_segments.append({
                 "start": float(seg["start"]),
@@ -202,6 +270,13 @@ class Whisper(BaseASR):
 
         final_text = " ".join(s["text"] for s in kept_segments).strip()
         final_text = self._remove_repeated_phrases(final_text)
+
+        logger.info(
+            "openai-whisper transcribe summary: model=%s segments_total=%d kept=%d dropped=%d "
+            "language=%s",
+            self.model_name, len(result.get("segments", [])), len(kept_segments), dropped,
+            result.get("language"),
+        )
 
         return {
             "text": final_text,
