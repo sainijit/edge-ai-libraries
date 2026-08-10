@@ -51,6 +51,10 @@ class SpeakerIdentityStore:
     speaker turns are compared against that frozen embedding via cosine
     similarity; matches above ``similarity_threshold`` are tagged primary,
     regardless of what anonymous label pyannote assigned them this time.
+
+    Rejections are additionally gated by ``verify_min_duration_sec``: a label
+    backed by less speech than this is considered too short to judge, and is
+    resolved as primary rather than rejected. See ``resolve`` for the rationale.
     """
 
     def __init__(
@@ -58,10 +62,12 @@ class SpeakerIdentityStore:
         similarity_threshold: float = 0.75,
         lock_min_duration_sec: float = 0.75,
         session_ttl_seconds: float = 1800.0,
+        verify_min_duration_sec: float = 1.5,
     ):
         self.similarity_threshold = similarity_threshold
         self.lock_min_duration_sec = lock_min_duration_sec
         self.session_ttl_seconds = session_ttl_seconds
+        self.verify_min_duration_sec = verify_min_duration_sec
         self._sessions: dict[str, _SessionIdentity] = {}
         self._lock = threading.Lock()
 
@@ -153,14 +159,53 @@ class SpeakerIdentityStore:
 
             primary_embedding = state.primary_embedding
 
+        # Speaking time per label in THIS chunk, used to decide whether the
+        # embedding is backed by enough audio to be worth trusting.
+        durations = self._turn_durations(turns)
+
         result: dict[str, bool] = {}
         for label, embedding in label_embeddings.items():
             similarity = _cosine_similarity(np.asarray(embedding, dtype=np.float32), primary_embedding)
             is_primary = similarity >= self.similarity_threshold
+            label_duration = durations.get(label, 0.0)
+
+            # ── Duration-gated abstention ────────────────────────────────────
+            # A speaker embedding computed from a very short span is not a weak
+            # signal, it is noise: cosine similarity against the enrolled
+            # reference is dominated by phonetic content rather than voice
+            # identity. Enrollment already refuses to trust such spans (see
+            # lock_min_duration_sec, and the >=1.5s span requirement in
+            # PyannoteDiarizer's re-enrollment), so rejection must honour the
+            # same evidence bar — otherwise the tail of a sentence that spills
+            # past a chunk boundary gets clustered as a "new speaker" and the
+            # customer's own words are silently discarded.
+            #
+            # When the span is too short to judge, ABSTAIN in favour of the
+            # primary rather than rejecting. This does not weaken bystander
+            # protection: a bystander uttering anything actionable produces far
+            # more than verify_min_duration_sec of speech and is still checked
+            # against the threshold normally.
+            if (
+                not is_primary
+                and self.verify_min_duration_sec > 0
+                and label_duration < self.verify_min_duration_sec
+            ):
+                logger.info(
+                    "[SPEAKER-IDENTITY] session=%s | label=%s similarity=%.3f below threshold=%.2f "
+                    "BUT duration=%.2fs < verify_min_duration=%.2fs — too little audio to judge, "
+                    "ABSTAINING (treated as primary)",
+                    session_id, label, similarity, self.similarity_threshold,
+                    label_duration, self.verify_min_duration_sec,
+                )
+                result[label] = True
+                continue
+
             result[label] = is_primary
             logger.info(
-                "[SPEAKER-IDENTITY] session=%s | label=%s similarity=%.3f (threshold=%.2f) → is_primary=%s",
-                session_id, label, similarity, self.similarity_threshold, is_primary,
+                "[SPEAKER-IDENTITY] session=%s | label=%s similarity=%.3f (threshold=%.2f) "
+                "duration=%.2fs → is_primary=%s",
+                session_id, label, similarity, self.similarity_threshold,
+                label_duration, is_primary,
             )
         return result
 

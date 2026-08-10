@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 class PyannoteDiarizer:
+    # Minimum extra speech an upgrade candidate must offer before it replaces
+    # a provisional reference. Prevents churning the reference between
+    # near-identical spans while it is still being strengthened.
+    _ENROLLMENT_UPGRADE_MARGIN: float = 0.25
+
     def __init__(self, device: str = "cpu", hf_token: str | None = None):
         diar_cfg = config.models.diarization
         pipeline_source = diar_cfg.name
@@ -72,6 +77,10 @@ class PyannoteDiarizer:
         )
         # session_id → L2-normalized primary embedding
         self._primary_embeddings: dict[str, np.ndarray] = {}
+        # session_id → seconds of audio the stored reference was built from.
+        # A reference derived from very little speech is not yet trustworthy
+        # enough to reject anyone with (see enrollment_trust_duration).
+        self._enrollment_durations: dict[str, float] = {}
         # session_id → monotonic timestamp of last use (for TTL eviction)
         self._enrollment_last_used: dict[str, float] = {}
         # session_id → consecutive chunks in which every segment was rejected.
@@ -105,6 +114,50 @@ class PyannoteDiarizer:
         self.min_window_seconds = float(
             getattr(diar_cfg, "min_window_seconds", 0.8)
         )
+        # Minimum total segment span required before a BELOW-threshold
+        # similarity is allowed to label the segment as a secondary speaker.
+        #
+        # _label_for already resolves *missing* evidence (NaN similarity) to
+        # the primary so a real customer is never lost. This extends the same
+        # principle to *weak* evidence: an embedding computed over a very short
+        # span is dominated by phonetic content rather than voice identity, so
+        # a low similarity there is noise, not proof of a different speaker.
+        # _extract_embedding only declines below 250ms, which left a 0.25-1.5s
+        # band being judged with full confidence on unreliable evidence.
+        #
+        # Concretely, this is what silently dropped the tail of any sentence
+        # that spilled past a chunk boundary: a 0.84s fragment scored below
+        # threshold, was labelled SPEAKER_01 and discarded downstream, so
+        # "...suggest something to drink" reached the agent as
+        # "...suggest some".
+        #
+        # The guard applies to the segment as a whole. Intra-segment speaker
+        # splitting is unaffected, so a genuine bystander interjecting inside a
+        # long segment is still detected. Set to 0 to disable.
+        self.voice_verify_min_duration = float(
+            getattr(diar_cfg, "voice_verify_min_duration", 1.5)
+        )
+        # Seconds of enrolled audio required before the reference is trusted
+        # enough to label anyone as a secondary speaker.
+        #
+        # enrollment_window_seconds is only an upper bound: enrollment takes
+        # whatever the first qualifying chunk happens to contain. At a kiosk
+        # the opening chunk is flushed at the speaker's first pause, so a real
+        # conversation typically enrolls from ~2s even when the window allows
+        # 4s. Since the same reference is then reused for the whole
+        # conversation, that one weak sample decides every later verdict, and
+        # the measured same-speaker cosine spread at short reference lengths
+        # (0.21-0.68) is far wider than the customer/bystander gap — so the
+        # customer's own speech gets rejected for the rest of the session.
+        #
+        # Until this much audio is enrolled the reference is PROVISIONAL:
+        # every segment resolves to the primary, and the reference is upgraded
+        # in place as longer speech arrives. Same principle _label_for already
+        # applies to unknown similarity — absence of trustworthy evidence must
+        # not become a negative verdict. 0 trusts any enrollment immediately.
+        self.enrollment_trust_duration = float(
+            getattr(diar_cfg, "enrollment_trust_duration", 4.0)
+        )
         # Span taken from the start of the first qualifying segment when
         # enrolling the primary voice.
         self.enrollment_window_seconds = float(
@@ -130,6 +183,7 @@ class PyannoteDiarizer:
             self._primary_embeddings.pop(session_id, None)
             self._enrollment_last_used.pop(session_id, None)
             self._rejection_streak.pop(session_id, None)
+            self._enrollment_durations.pop(session_id, None)
 
     def _evict_stale_enrollments(self) -> None:
         """Drop enrolled voices unused for longer than the TTL.
@@ -150,6 +204,7 @@ class PyannoteDiarizer:
             self._primary_embeddings.pop(key, None)
             self._enrollment_last_used.pop(key, None)
             self._rejection_streak.pop(key, None)
+            self._enrollment_durations.pop(key, None)
         if stale:
             logger.info(
                 "[DIARIZATION][ENROLL] evicted %d stale enrollment(s) after %.0fs idle",
@@ -348,6 +403,50 @@ class PyannoteDiarizer:
             segment when word timings are unavailable.
         """
         words = segment.get("words") or []
+
+        # ── Duration-gated abstention ────────────────────────────────────────
+        # Two ways the evidence can be too weak to name a second speaker:
+        #   1. the reference itself is still provisional (built from too
+        #      little speech to be discriminative), or
+        #   2. this segment is too short for its embedding to carry voice
+        #      identity rather than phonetic content.
+        # Either way, judging it would mean deleting real customer speech on a
+        # coin flip — the failure that dropped severed sentence tails and, with
+        # a weak 2s reference, whole utterances. Resolve to primary instead,
+        # exactly as _label_for already does for unknown similarity.
+        segment_duration = self._segment_duration(segment, words)
+        provisional = self._is_enrollment_provisional(session_key)
+        too_short = (
+            self.voice_verify_min_duration > 0
+            and segment_duration < self.voice_verify_min_duration
+        )
+        if provisional or too_short:
+            if provisional:
+                cause = (
+                    f"reference still provisional "
+                    f"({self._enrollment_durations.get(session_key, 0.0):.2f}s "
+                    f"< enrollment_trust_duration="
+                    f"{self.enrollment_trust_duration:.2f}s)"
+                )
+            else:
+                cause = (
+                    f"segment duration={segment_duration:.2f}s "
+                    f"< voice_verify_min_duration="
+                    f"{self.voice_verify_min_duration:.2f}s"
+                )
+            logger.info(
+                "[DIARIZATION][MATCH] session=%s segment [%.2fs-%.2fs] %s — "
+                "not enough evidence to identify the speaker, ABSTAINING "
+                "(kept as SPEAKER_00)",
+                session_key,
+                float(segment.get("start", 0.0)),
+                float(segment.get("end", 0.0)),
+                cause,
+            )
+            labelled = dict(segment)
+            labelled["speaker"] = "SPEAKER_00"
+            return [labelled]
+
         if not words:
             similarity = self._segment_similarity(
                 waveform, sample_rate, segment, primary_embedding
@@ -491,6 +590,37 @@ class PyannoteDiarizer:
         # the primary speaker, so surface it instead of dropping it.
         return [{**seg, "speaker": "SPEAKER_00"} for seg in sub_segments]
 
+    @staticmethod
+    def _segment_duration(segment: dict, words: list[dict]) -> float:
+        """Speech span of a segment, in seconds.
+
+        Word timings are preferred when available because Whisper's segment
+        bounds can extend over leading/trailing silence, which would overstate
+        how much *speech* an embedding was actually computed from.
+
+        Args:
+            segment: Whisper segment with ``start``/``end``.
+            words: Word-level timings for the segment; may be empty.
+
+        Returns:
+            Duration in seconds, never negative.
+        """
+        if words:
+            try:
+                return max(
+                    0.0,
+                    float(words[-1]["end"]) - float(words[0]["start"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+        try:
+            return max(
+                0.0,
+                float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)),
+            )
+        except (TypeError, ValueError):
+            return 0.0
+
     def _label_for(self, similarity: float) -> str:
         """Map a cosine similarity to a speaker label.
 
@@ -551,11 +681,41 @@ class PyannoteDiarizer:
         existing = self._primary_embeddings.get(session_key)
         if existing is not None:
             self._enrollment_last_used[session_key] = time.monotonic()
-            return existing
+            enrolled = self._enrollment_durations.get(session_key, 0.0)
+            if enrolled >= self.enrollment_trust_duration:
+                return existing
+            # Reference still provisional: it was built from too little speech
+            # to reject anyone with. Trade up if this chunk offers a strictly
+            # longer span, so the reference converges on the customer's real
+            # voice instead of being frozen at the opening 2 seconds.
+            upgraded = self._enroll_from_segments(
+                waveform,
+                sample_rate,
+                segments,
+                session_key,
+                min_duration=enrolled + self._ENROLLMENT_UPGRADE_MARGIN,
+                reason=f"upgrading provisional {enrolled:.2f}s reference",
+            )
+            return upgraded if upgraded is not None else existing
 
         return self._enroll_from_segments(
             waveform, sample_rate, segments, session_key
         )
+
+    def _is_enrollment_provisional(self, session_key: str) -> bool:
+        """Whether the stored reference is too weak to reject a speaker with.
+
+        Args:
+            session_key: conversation-scoped enrollment key.
+
+        Returns:
+            ``True`` while the reference was derived from less than
+            ``enrollment_trust_duration`` seconds of speech.
+        """
+        if self.enrollment_trust_duration <= 0:
+            return False
+        enrolled = self._enrollment_durations.get(session_key, 0.0)
+        return enrolled < self.enrollment_trust_duration
 
     def _enroll_from_segments(
         self,
@@ -610,6 +770,7 @@ class PyannoteDiarizer:
             self._primary_embeddings[session_key] = embedding
             self._enrollment_last_used[session_key] = time.monotonic()
             self._rejection_streak[session_key] = 0
+            self._enrollment_durations[session_key] = end_s - start_s
             logger.info(
                 "[DIARIZATION][ENROLL] session=%s enrolled primary speaker "
                 "from [%.2fs-%.2fs] duration=%.2fs (%s)",
@@ -907,6 +1068,9 @@ class PyannoteDiarizer:
 
             primary_embedding = turn_embeddings[best_idx]
             self._primary_embeddings[session_key] = primary_embedding
+            self._enrollment_durations[session_key] = (
+                segments[best_idx]["end"] - segments[best_idx]["start"]
+            )
             logger.info(
                 "[DIARIZATION][ENROLL] session=%s enrolled primary speaker "
                 "from turn [%.2fs-%.2fs] duration=%.2fs (pyannote label=%s)",

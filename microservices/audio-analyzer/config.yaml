@@ -80,6 +80,19 @@ models:
       enabled: true
       similarity_threshold: 0.75   # cosine similarity to match stored primary
       lock_min_duration_sec: 0.75  # min turn duration before it can be locked as primary
+      # Minimum speech a label must carry in a chunk before a BELOW-threshold
+      # similarity is allowed to reject it. Embeddings from very short spans
+      # are dominated by phonetic content rather than voice identity, so a
+      # low similarity there is noise, not evidence. Below this duration the
+      # store abstains and resolves the label as primary.
+      #
+      # Without this guard the tail of a sentence that spills past a chunk
+      # boundary (e.g. "...some" | "thing to drink.") gets clustered as a new
+      # speaker and the customer's own words are silently dropped.
+      #
+      # 1.5s mirrors the span PyannoteDiarizer already requires before it will
+      # trust an embedding for (re-)enrollment. Set to 0 to disable.
+      verify_min_duration_sec: 1.5
       session_ttl_seconds: 1800    # evict idle session identity state after 30 min
 
 audio_preprocessing:

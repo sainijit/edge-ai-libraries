@@ -189,7 +189,7 @@ class Whisper(BaseASR):
             t += 0.2
         return tuple(schedule) if schedule else (start,)
 
-    def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None) -> Dict[str, Any]:
+    def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None, prompt: str | None = None) -> Dict[str, Any]:
         """
         Transcribe audio with strong silence suppression and zero speech loss.
         """
@@ -204,6 +204,12 @@ class Whisper(BaseASR):
             temperature=self._temperature_schedule(temperature),
             language=language,
             condition_on_previous_text=False,
+            # Domain vocabulary primer. Whisper treats this as preceding
+            # transcript text, biasing the decoder toward menu spellings it
+            # would otherwise render phonetically ("Aloo Tikki Burger" rather
+            # than "and 2,000"). Independent of condition_on_previous_text,
+            # which stays False so a bad chunk cannot seed a repetition loop.
+            initial_prompt=prompt,
             no_speech_threshold=self.NO_SPEECH_THRESHOLD,
             logprob_threshold=self.LOGPROB_THRESHOLD,
 

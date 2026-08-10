@@ -13,7 +13,7 @@ class Whisper(BaseASR):
         self.model_path = get_asr_model_path()
         self.model = ov_genai.WhisperPipeline( self.model_path, device=device)
  
-   def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None) -> dict:
+   def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None, prompt: str | None = None) -> dict:
         audio, sr = self._load_wav_mono_16k(audio_path)
         gen_kwargs = {"return_timestamps": True}
         if language:

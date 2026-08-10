@@ -133,20 +133,20 @@ class Pipeline:
             "chunk_sentiments": chunk_sentiments,
         })
 
-    def _iter_chunk_transcriptions(self, input, language: str | None = None):
+    def _iter_chunk_transcriptions(self, input, language: str | None = None, prompt: str | None = None):
         """Yield (chunk_transcription, sentiment_result) for each chunk.
         ASR and sentiment run in parallel via a thread pool."""
         chunk_generator = chunk_by_silence(input, self.session_id)
 
         if not SENTIMENT_ENABLED:
-            for chunk in self.asr_component.process(chunk_generator, language=language):
+            for chunk in self.asr_component.process(chunk_generator, language=language, prompt=prompt):
                 self._cleanup_chunk(chunk.get("chunk_path"))
                 yield chunk, {}
             return
 
         # Buffer chunks so we can fan-out ASR + sentiment concurrently
         with ThreadPoolExecutor(max_workers=2) as pool:
-            for chunk_transcription in self.asr_component.process(chunk_generator, language=language):
+            for chunk_transcription in self.asr_component.process(chunk_generator, language=language, prompt=prompt):
                 chunk_path = chunk_transcription.get("chunk_path")
                 fut = pool.submit(self._run_sentiment, chunk_path)
                 sentiment = fut.result()
@@ -182,7 +182,7 @@ class Pipeline:
     ) -> str | None:
         return current_language or chunk_transcription.get("language")
 
-    def stream_transcribe(self, input, language: str | None = None):
+    def stream_transcribe(self, input, language: str | None = None, prompt: str | None = None):
         detected_language = language or self._session_state.get("language")
         base_duration = float(self._session_state.get("duration", 0.0))
         all_segments = [dict(segment) for segment in self._session_state.get("segments", [])]
@@ -192,7 +192,7 @@ class Pipeline:
         chunk_index_offset = len(chunk_sentiments)
 
         for chunk_index, (chunk_transcription, sentiment) in enumerate(
-            self._iter_chunk_transcriptions(input, language=language)
+            self._iter_chunk_transcriptions(input, language=language, prompt=prompt)
         ):
             chunk_transcription = self._apply_offset_to_chunk(chunk_transcription, base_duration)
             detected_language = self._resolve_output_language(detected_language, chunk_transcription)
@@ -249,7 +249,7 @@ class Pipeline:
         self._persist_session_outputs(detected_language, duration, final_text, all_segments, chunk_sentiments)
         yield final_event
 
-    def transcribe(self, input, language: str | None = None) -> dict:
+    def transcribe(self, input, language: str | None = None, prompt: str | None = None) -> dict:
         detected_language = language or self._session_state.get("language")
         base_duration = float(self._session_state.get("duration", 0.0))
         segments = [dict(segment) for segment in self._session_state.get("segments", [])]
@@ -257,7 +257,7 @@ class Pipeline:
         duration = base_duration
         chunk_sentiments = list(self._session_state.get("chunk_sentiments", []))
 
-        for chunk_transcription, sentiment in self._iter_chunk_transcriptions(input, language=language):
+        for chunk_transcription, sentiment in self._iter_chunk_transcriptions(input, language=language, prompt=prompt):
             chunk_transcription = self._apply_offset_to_chunk(chunk_transcription, base_duration)
             detected_language = self._resolve_output_language(detected_language, chunk_transcription)
             chunk_text = chunk_transcription.get("text", "").strip()

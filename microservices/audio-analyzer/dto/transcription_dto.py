@@ -10,6 +10,12 @@ from dto.audiosource import AudioSource
 SUPPORTED_OPENAI_MODELS = {"whisper-1"}
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
 MAX_LANGUAGE_LENGTH = 32
+# Whisper's decoder reserves half its 448-token context for the prompt (224
+# tokens). Longer input is silently truncated from the left, which would drop
+# the very vocabulary the caller wanted primed, so reject it explicitly
+# instead. ~4 chars/token gives a bound comfortably above 224 tokens while
+# still refusing pathological payloads.
+MAX_PROMPT_LENGTH = 1024
 MIN_TEMPERATURE = 0.0
 MAX_TEMPERATURE = 1.0
  
@@ -50,7 +56,7 @@ def validate_transcription_options(
         raise HTTPException(status_code=400, detail="language is too long")
 
     normalized_prompt = _normalize_optional_text(prompt)
-    if normalized_prompt:
-        raise HTTPException(status_code=400, detail="prompt is not currently supported")
+    if normalized_prompt and len(normalized_prompt) > MAX_PROMPT_LENGTH:
+        raise HTTPException(status_code=400, detail="prompt is too long")
 
     return normalized_language, normalized_prompt

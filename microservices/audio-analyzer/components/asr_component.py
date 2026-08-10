@@ -21,6 +21,7 @@ _identity_cfg = getattr(_diar_cfg, "identity", None)
 IDENTITY_ENABLED = bool(getattr(_identity_cfg, "enabled", True))
 IDENTITY_SIMILARITY_THRESHOLD = float(getattr(_identity_cfg, "similarity_threshold", 0.75))
 IDENTITY_LOCK_MIN_DURATION_SEC = float(getattr(_identity_cfg, "lock_min_duration_sec", 0.75))
+IDENTITY_VERIFY_MIN_DURATION_SEC = float(getattr(_identity_cfg, "verify_min_duration_sec", 1.5))
 IDENTITY_SESSION_TTL_SECONDS = float(getattr(_identity_cfg, "session_ttl_seconds", 1800.0))
 
 
@@ -123,6 +124,7 @@ class ASRComponent(PipelineComponent):
                         similarity_threshold=IDENTITY_SIMILARITY_THRESHOLD,
                         lock_min_duration_sec=IDENTITY_LOCK_MIN_DURATION_SEC,
                         session_ttl_seconds=IDENTITY_SESSION_TTL_SECONDS,
+                        verify_min_duration_sec=IDENTITY_VERIFY_MIN_DURATION_SEC,
                     )
             except Exception as exc:
                 logger.warning(
@@ -136,7 +138,7 @@ class ASRComponent(PipelineComponent):
                 self.enable_diarization = False
                 self.pyannote_diarizer = None
 
-    def process(self, input_generator, language: str | None = None):
+    def process(self, input_generator, language: str | None = None, prompt: str | None = None):
 
         project_path = get_session_dir(self.session_id)
 
@@ -153,6 +155,7 @@ class ASRComponent(PipelineComponent):
                     chunk_path,
                     temperature=self.temperature,
                     language=language,
+                    prompt=prompt,
                 )
                 elapsed_ms = (time.monotonic() - _t0) * 1000
                 asr_latency.record(elapsed_ms)

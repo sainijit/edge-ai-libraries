@@ -149,7 +149,7 @@ class WhisperCpp(BaseASR):
             return False
         return True
 
-    def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None) -> Dict[str, Any]:
+    def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None, prompt: str | None = None) -> Dict[str, Any]:
         transcribe_kwargs = {
             "temperature": temperature,
             "token_timestamps": self.word_timestamps,

@@ -24,14 +24,41 @@ class ApiHardeningTests(unittest.TestCase):
             }
         }
 
-    def test_openai_transcription_rejects_prompt(self):
+    def test_openai_transcription_accepts_prompt(self):
+        """A prompt is now honoured, not rejected.
+
+        The endpoint used to return 400 "prompt is not currently supported".
+        The kiosk sends the menu vocabulary as an initial prompt so Whisper
+        spells real product names correctly ("Aloo Tikki", not "aloo tiki"),
+        which the ordering catalogue then matches. Rejecting it broke that,
+        so the only assertion here is that the old refusal is gone — the
+        transcription itself runs on fake audio and its outcome is not the
+        subject of this test.
+        """
         with patch("main.ensure_model"), patch("main.preload_models"):
             with TestClient(main.app) as client:
                 response = client.post(
                     "/v1/audio/transcriptions",
                     data={
                         "model": "whisper-1",
-                        "prompt": "bias this result",
+                        "prompt": "Aloo Tikki Burger, Paneer Tikka Burger",
+                        "temperature": "0.0",
+                        "response_format": "json",
+                    },
+                    files={"file": ("clip.wav", b"fake-audio", "audio/wav")},
+                )
+
+        self.assertNotIn("prompt is not currently supported", response.text)
+
+    def test_openai_transcription_rejects_overlong_prompt(self):
+        """An unbounded prompt would evict the audio from Whisper's context."""
+        with patch("main.ensure_model"), patch("main.preload_models"):
+            with TestClient(main.app) as client:
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    data={
+                        "model": "whisper-1",
+                        "prompt": "x" * 2000,
                         "temperature": "0.0",
                         "response_format": "json",
                     },
@@ -42,7 +69,7 @@ class ApiHardeningTests(unittest.TestCase):
         self.assertEqual(
             response.json(),
             self._openai_error(
-                "prompt is not currently supported",
+                "prompt is too long",
                 "invalid_request_error",
                 code="invalid_request",
             ),

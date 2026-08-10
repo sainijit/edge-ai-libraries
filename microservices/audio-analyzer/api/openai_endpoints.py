@@ -16,7 +16,12 @@ from utils.subtitle_format import format_srt as _format_srt, format_vtt as _form
 router = APIRouter()
 
 
-def _sse_transcription_events(pipeline: Pipeline, filepath: str, language: str | None):
+def _sse_transcription_events(
+    pipeline: Pipeline,
+    filepath: str,
+    language: str | None,
+    prompt: str | None = None,
+):
     """Yield OpenAI-compatible SSE frames for a streamed transcription.
 
     Emits `transcript.text.delta` per transcribed chunk, a final
@@ -26,7 +31,7 @@ def _sse_transcription_events(pipeline: Pipeline, filepath: str, language: str |
     """
     request = SimpleNamespace(audio_filename=filepath, source_type=AudioSource.AUDIO_FILE)
 
-    for event in pipeline.stream_transcribe(request, language=language):
+    for event in pipeline.stream_transcribe(request, language=language, prompt=prompt):
         if event.get("event") == "transcription.chunk":
             delta = (event.get("text") or "").strip()
             if delta:
@@ -59,7 +64,7 @@ def transcribe_audio(
     temperature: float = Form(0.0),
     stream: bool = Form(False),
 ):
-    language, _ = validate_transcription_options(
+    language, prompt = validate_transcription_options(
         temperature=temperature,
         language=language,
         prompt=prompt,
@@ -90,7 +95,7 @@ def transcribe_audio(
                 detail=f"stream=true is not supported with response_format='{response_format}'",
             )
         response = StreamingResponse(
-            _sse_transcription_events(pipeline, filepath, language),
+            _sse_transcription_events(pipeline, filepath, language, prompt),
             media_type="text/event-stream",
         )
         response.headers["X-Session-ID"] = pipeline.session_id
@@ -103,6 +108,7 @@ def transcribe_audio(
             source_type=AudioSource.AUDIO_FILE,
         ),
         language=language,
+        prompt=prompt,
     )
 
     if response_format == "text":

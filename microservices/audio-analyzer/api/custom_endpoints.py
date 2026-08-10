@@ -66,10 +66,12 @@ def stream_transcribe_audio(
     session_id: str | None = Form(None),
     language: str | None = Form("en"),
     temperature: float = Form(0.0),
+    prompt: str | None = Form(None),
 ):
-    language, _ = validate_transcription_options(
+    language, prompt = validate_transcription_options(
         temperature=temperature,
         language=language,
+        prompt=prompt,
     )
 
     try:
@@ -87,7 +89,7 @@ def stream_transcribe_audio(
             audio_filename=filepath,
             source_type=AudioSource.AUDIO_FILE,
         )
-        for chunk in pipeline.stream_transcribe(request, language=language):
+        for chunk in pipeline.stream_transcribe(request, language=language, prompt=prompt):
             yield json.dumps(chunk) + "\n"
 
     response = StreamingResponse(iter_stream(), media_type="application/x-ndjson")

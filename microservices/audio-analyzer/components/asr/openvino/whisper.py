@@ -54,7 +54,7 @@ class Whisper(BaseASR):
 
         logger.info(f"OpenVINO Whisper models loaded successfully. Decoder inputs: {self.decoder_input_names}")
  
-    def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None) -> dict:
+    def transcribe(self, audio_path: str, temperature: float = 0.0, language: str | None = None, prompt: str | None = None) -> dict:
         
         # --- Load audio ---
         audio, sr = self._load_wav_mono_16k(audio_path)
