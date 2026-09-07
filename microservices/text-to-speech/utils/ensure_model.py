@@ -98,6 +98,12 @@ def ensure_model() -> None:
         _convert_openvino_model(get_tts_model_path())
         return
 
+    if runtime == "kokoro":
+        from utils.ensure_kokoro import ensure
+
+        ensure(get_tts_model_path())
+        return
+
     if runtime != "pytorch":
         raise ValueError(f"Unsupported TTS runtime: {runtime}")
 
@@ -132,4 +138,9 @@ def resolve_tts_model_source() -> str:
         return output_dir
     if runtime == "pytorch" and os.path.isdir(output_dir) and any(os.scandir(output_dir)):
         return output_dir
+    if runtime == "kokoro":
+        from utils.ensure_kokoro import model_exists
+
+        if model_exists(output_dir):
+            return output_dir
     return _model_name()

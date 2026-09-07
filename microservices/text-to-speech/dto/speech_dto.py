@@ -53,6 +53,27 @@ class SpeechRequest(BaseModel):
 
         if configured_model_normalized.startswith("qwen/") or "qwen3-tts" in configured_model_normalized:
             self._validate_for_qwen(model_variant)
+            return
+
+        if "kokoro" in configured_model_normalized:
+            self._validate_for_kokoro()
+
+    def _validate_for_kokoro(self) -> None:
+        from components.tts.kokoro import kokoro_tts
+
+        default_language = config.models.tts.default_language.strip()
+
+        if self.language and self.language.lower() != default_language.lower():
+            raise ValueError(f"Only {default_language} is currently supported for speech synthesis.")
+
+        if self.voice and not kokoro_tts.is_supported_voice(self.voice):
+            raise ValueError(
+                f"Unsupported voice '{self.voice}'. "
+                f"Supported voices: {', '.join(kokoro_tts.SUPPORTED_VOICES)}."
+            )
+
+        if self.instructions:
+            raise ValueError("Kokoro does not support free-form voice instructions.")
 
     def _validate_for_speecht5(self) -> None:
         from components.tts import speecht5_voices
