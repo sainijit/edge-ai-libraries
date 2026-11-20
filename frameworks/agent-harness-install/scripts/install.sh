@@ -11,10 +11,34 @@ set -euo pipefail
 
 # Repo root is one level up from this payload script.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-for lib in colors verify state sudo shim gpu-intel docker-setup nodejs python-setup openvino inference-router agents harness-mcp openshell; do
-  # shellcheck disable=SC1090
-  . "${SCRIPT_DIR}/scripts/lib/${lib}.sh"
-done
+# shellcheck source=lib/colors.sh
+. "${SCRIPT_DIR}/scripts/lib/colors.sh"
+# shellcheck source=lib/verify.sh
+. "${SCRIPT_DIR}/scripts/lib/verify.sh"
+# shellcheck source=lib/state.sh
+. "${SCRIPT_DIR}/scripts/lib/state.sh"
+# shellcheck source=lib/sudo.sh
+. "${SCRIPT_DIR}/scripts/lib/sudo.sh"
+# shellcheck source=lib/shim.sh
+. "${SCRIPT_DIR}/scripts/lib/shim.sh"
+# shellcheck source=lib/gpu-intel.sh
+. "${SCRIPT_DIR}/scripts/lib/gpu-intel.sh"
+# shellcheck source=lib/docker-setup.sh
+. "${SCRIPT_DIR}/scripts/lib/docker-setup.sh"
+# shellcheck source=lib/nodejs.sh
+. "${SCRIPT_DIR}/scripts/lib/nodejs.sh"
+# shellcheck source=lib/python-setup.sh
+. "${SCRIPT_DIR}/scripts/lib/python-setup.sh"
+# shellcheck source=lib/openvino.sh
+. "${SCRIPT_DIR}/scripts/lib/openvino.sh"
+# shellcheck source=lib/inference-router.sh
+. "${SCRIPT_DIR}/scripts/lib/inference-router.sh"
+# shellcheck source=lib/agents.sh
+. "${SCRIPT_DIR}/scripts/lib/agents.sh"
+# shellcheck source=lib/harness-mcp.sh
+. "${SCRIPT_DIR}/scripts/lib/harness-mcp.sh"
+# shellcheck source=lib/openshell.sh
+. "${SCRIPT_DIR}/scripts/lib/openshell.sh"
 
 TOTAL_STEPS=3
 NON_INTERACTIVE="${NON_INTERACTIVE:-}"
@@ -67,6 +91,8 @@ usage() {
     HERMES_INSTALL_URL            Custom Hermes installer URL (default: scripts/install.sh at a pinned hermes-agent commit, checksum built in)
     HERMES_INSTALL_SHA256         Expected SHA-256 of the Hermes installer (required with HERMES_INSTALL_URL unless HERMES_ALLOW_UNVERIFIED_INSTALL=1)
     HERMES_ALLOW_UNVERIFIED_INSTALL  Run a custom Hermes installer without a pinned checksum (not recommended)
+    HERMES_PINNED_COMMIT, HERMES_PINNED_SHA256  Install another hermes-agent release: its full commit SHA and the SHA-256 of scripts/install.sh
+                                  at that commit (set both together; default: the release this installer was validated with)
     DCODE_INSTALL_URL             Custom dcode installer URL (default: libs/code/scripts/install.sh at a pinned deepagents commit, checksum built in)
     DCODE_INSTALL_SHA256          Expected SHA-256 of the dcode installer (required with DCODE_INSTALL_URL unless HARNESS_ALLOW_UNVERIFIED_DCODE_INSTALL=1)
     HARNESS_ALLOW_UNVERIFIED_DCODE_INSTALL  Run a custom dcode installer without a pinned checksum (not recommended)
@@ -84,7 +110,7 @@ usage() {
     HARNESS_OVMS_EXPORT_IMAGE     OVMS "-py" image used by the docker-pull exporter to convert non-OpenVINO/* models (default: openvino/model_server:2026.1-py)
     HARNESS_BACKEND_NETWORK      Docker network joining OVMS + the Inference Router so they can reach each other by name (default: agent-harness-install-backend)
     MIN_NODE_VERSION
-    HARNESS_OVMS_EXTRA_ARGS       Extra OVMS server flags (e.g. --tool_parser <parser>)
+    HARNESS_OVMS_EXTRA_ARGS       Extra OVMS server flags (e.g. --log_level DEBUG); not for per-model options such as --tool_parser
     HARNESS_OVMS_EXPORTER         docker-pull (default) | export-model-py | model-download | hf-snapshot (see Known limitations)
     HARNESS_HF_MODEL_REVISION     Pin an exact HF revision (commit/tag/branch) for the hf-snapshot exporter
     HARNESS_OVMS_EXPORT_MODEL_PY_SHA256, HARNESS_OVMS_EXPORT_MODEL_REQUIREMENTS_SHA256  Pin export_model.py/requirements.txt (export-model-py exporter only)
@@ -256,7 +282,7 @@ install just Node.js, then re-run ./install.sh."
 }
 
 print_done() {
-  printf "\n${C_GREEN}${C_BOLD}=== Installation complete ===${C_RESET}\n\n"
+  printf '\n%s%s=== Installation complete ===%s\n\n' "$C_GREEN" "$C_BOLD" "$C_RESET"
 }
 
 # print_status — combined health view: host/GPU, OVMS, the Inference Router,
@@ -264,7 +290,7 @@ print_done() {
 print_status() {
   local agent cli_bin
 
-  printf "\n${C_BOLD}Host${C_RESET}\n"
+  printf '\n%sHost%s\n' "$C_BOLD" "$C_RESET"
   if command_exists docker && docker info >/dev/null 2>&1; then
     ok "Docker is running"
   else
@@ -276,7 +302,7 @@ print_status() {
     info "No Intel GPU detected (CPU-only)"
   fi
 
-  printf "\n${C_BOLD}Inference backend${C_RESET}\n"
+  printf '\n%sInference backend%s\n' "$C_BOLD" "$C_RESET"
   if [[ -n "${HARNESS_LLM_ROUTER_ENDPOINT:-}" ]]; then
     ok "Upstream routed externally — ${HARNESS_LLM_ROUTER_ENDPOINT} (not managed by this installer)"
   fi
@@ -337,7 +363,7 @@ print_status() {
     fi
   fi
 
-  printf "\n${C_BOLD}Agent${C_RESET}\n"
+  printf '\n%sAgent%s\n' "$C_BOLD" "$C_RESET"
   local display
   agent="$(resolve_installed_agent)"
   # agent_cli_bin returns 1 on an unrecognized name -- status is read-only
@@ -361,9 +387,23 @@ shell's PATH yet — open a new terminal, or re-source your shell profile."
   printf "\n"
 }
 
+# nvm's node is not on PATH in a fresh shell; without it the node-based config.json lookups fail.
+ensure_node_on_path() {
+  set +u
+  ensure_nvm_loaded
+  if ! command_exists node && command_exists nvm; then
+    nvm use "$HARNESS_NODE_VERSION" --silent 2>/dev/null || nvm use default --silent 2>/dev/null || true
+  fi
+  set -u
+  return 0
+}
+
 run_models_command() {
   local verb="${1:-}" name="${2:-}"
   [[ -n "$verb" ]] || { usage; error "models requires a verb (list/remove)."; }
+  ensure_node_on_path
+  command_exists node \
+    || warn "Node.js was not found; results may be incomplete. Run ./startup.sh --skip-docker --skip-python to install it."
   case "$verb" in
     list) list_exported_models ;;
     remove) remove_exported_model "$name" ;;
@@ -414,7 +454,9 @@ main() {
         HARNESS_RUNTIME="$2"; shift ;;
       --model)
         [[ -n "${2:-}" ]] || { usage; error "--model requires a value (the model name as its hub names it, e.g. a Hugging Face id)."; }
-        HARNESS_HF_MODEL="$2"; HARNESS_LLM_MODEL=""; shift ;;
+        HARNESS_HF_MODEL="$2"
+        HARNESS_LLM_MODEL=""
+        shift ;;
       --model-hub)
         [[ -n "${2:-}" ]] || { usage; error "--model-hub requires a value (e.g. openvino, huggingface, ollama)."; }
         HARNESS_MODEL_HUB="$2"; HARNESS_MODEL_HUB_WAS_SET=1; shift ;;
@@ -446,6 +488,12 @@ main() {
   export HARNESS_AGENT HARNESS_HF_MODEL HARNESS_MODEL_HUB HARNESS_MODEL_HUB_WAS_SET HARNESS_MODEL_CONFIG_JSON HARNESS_MODEL_TYPE
   export HARNESS_MODEL_PRECISION HARNESS_MODEL_DEVICE HARNESS_MODEL_DOWNLOAD_REVISION HARNESS_HF_MODEL_REVISION
   apply_model_source_defaults
+
+  # A half or malformed Hermes pin override must fail here, before prerequisite
+  # setup or ensure_inference_backend can touch an existing deployment.
+  case "${positional[0]:-}" in
+    "" | inference | onboard) validate_hermes_pin ;;
+  esac
 
   # Group refresh may exec this script again. Do it before opening the
   # deployment lock, so the new process cannot inherit and reacquire that lock.
@@ -489,13 +537,7 @@ run_installer_command() {
     exit 0
   fi
   if [[ "${positional[0]:-}" == "onboard" ]]; then
-    # nvm's node is not on PATH in a fresh shell; without it the registered-model lookup falls back to 'default'.
-    set +u
-    ensure_nvm_loaded
-    if ! command_exists node && command_exists nvm; then
-      nvm use "$HARNESS_NODE_VERSION" --silent 2>/dev/null || nvm use default --silent 2>/dev/null || true
-    fi
-    set -u
+    ensure_node_on_path
     run_agent_onboard
     exit 0
   fi
@@ -517,7 +559,7 @@ run_installer_command() {
       || error "OpenShell mode requires HARNESS_BIND_HOST=127.0.0.1; inference must not be LAN-published."
   fi
 
-  printf "\n${C_GREEN}${C_BOLD}agent-harness-install${C_RESET}\n\n"
+  printf '\n%s%sagent-harness-install%s\n\n' "$C_GREEN" "$C_BOLD" "$C_RESET"
 
   if [[ "${HARNESS_RUNTIME:-host}" == openshell ]]; then
     prepare_installer_host
